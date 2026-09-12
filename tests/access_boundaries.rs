@@ -503,6 +503,94 @@ fn rotation_with_reason_issues_new_key_and_revokes_old() {
 }
 
 // ---------------------------------------------------------------------------
+// Rotation guards: revoked or stale credentials cannot rotate (no gen
+// inflation, no revocation void, no holder DoS). Refusals write nothing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn revoked_credential_cannot_rotate() {
+    let scratch = Scratch::new("rotate-revoked");
+    let (gate, creds) = open_gate(&scratch, "access.db", &reason("rotate-revoked"));
+    gate.revoke(&creds.reviewer, &reason("rotate-revoked-revoke"))
+        .expect("revoke reviewer");
+    let before = gate.admission_count().expect("count");
+    // Revoked gen-1 credential must not rotate into a valid successor.
+    let err = gate
+        .rotate(
+            &creds.reviewer,
+            &KeyId::parse("key-reviewer-9").expect("key id"),
+            &synthetic_key("rotate-revoked", "next"),
+            &reason("rotate-revoked-try"),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "revoked-credential");
+    // Refusal writes nothing: no revoke row, no successor issue row.
+    assert_eq!(gate.admission_count().expect("count"), before);
+    // The attempted successor was never issued.
+    assert_eq!(
+        gate.enter_review(
+            Some(&Credential::new(
+                creds.reviewer.capability().clone(),
+                KeyId::parse("key-reviewer-9").expect("key id"),
+                synthetic_key("rotate-revoked", "probe"),
+            )),
+            &scope_a(),
+        )
+        .unwrap_err()
+        .code(),
+        "forged-credential"
+    );
+    println!("rotation: revoked credential refused rotate, no writes");
+}
+
+#[test]
+fn stale_generation_cannot_rotate_again() {
+    let scratch = Scratch::new("rotate-stale");
+    let (gate, creds) = open_gate(&scratch, "access.db", &reason("rotate-stale"));
+    // gen1 -> gen2 (happy path still works).
+    let rotated = gate
+        .rotate(
+            &creds.reviewer,
+            &KeyId::parse("key-reviewer-2").expect("key id"),
+            &synthetic_key("rotate-stale", "reviewer2"),
+            &reason("rotate-stale-first"),
+        )
+        .expect("first rotate");
+    assert_eq!(
+        gate.enter_review(Some(&rotated), &scope_a())
+            .expect("gen2 reviews")
+            .cap_generation,
+        2
+    );
+    let before = gate.admission_count().expect("count");
+    // Rotating the old gen-1 credential again is refused (it is revoked and
+    // stale; the revocation guard fires first, staleness is defense in
+    // depth). No gen-3 successor may appear.
+    let err = gate
+        .rotate(
+            &creds.reviewer,
+            &KeyId::parse("key-reviewer-3").expect("key id"),
+            &synthetic_key("rotate-stale", "reviewer3"),
+            &reason("rotate-stale-retry"),
+        )
+        .unwrap_err();
+    assert!(
+        err.code() == "revoked-credential" || err.code() == "stale-generation",
+        "unexpected code: {}",
+        err.code()
+    );
+    assert_eq!(gate.admission_count().expect("count"), before);
+    // gen2 remains current; no gen-3 exists.
+    assert_eq!(
+        gate.enter_review(Some(&rotated), &scope_a())
+            .expect("gen2 still current")
+            .cap_generation,
+        2
+    );
+    println!("rotation: stale gen-1 refused second rotate, gen-2 still current");
+}
+
+// ---------------------------------------------------------------------------
 // Revocation: offline-notary statement, fail closed on all paths + restart.
 // ---------------------------------------------------------------------------
 

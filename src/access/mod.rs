@@ -591,23 +591,32 @@ fn fingerprint_str(raw: &str) -> String {
 }
 
 fn pct_encode(raw: &str) -> String {
+    // Byte-oriented so multi-byte UTF-8 round-trips exactly: ASCII
+    // specials are escaped, printable ASCII passes through, and every
+    // other byte (non-ASCII UTF-8 bytes, controls, DEL) is %XX-encoded.
+    // The encoded form is therefore ASCII-only.
     let mut out = String::with_capacity(raw.len());
-    for c in raw.chars() {
-        match c {
-            '%' => out.push_str("%25"),
-            ';' => out.push_str("%3B"),
-            '=' => out.push_str("%3D"),
-            '\n' => out.push_str("%0A"),
-            '\r' => out.push_str("%0D"),
-            '\u{1f}' => out.push_str("%1F"),
-            c => out.push(c),
+    for &b in raw.as_bytes() {
+        match b {
+            b'%' => out.push_str("%25"),
+            b';' => out.push_str("%3B"),
+            b'=' => out.push_str("%3D"),
+            b'\n' => out.push_str("%0A"),
+            b'\r' => out.push_str("%0D"),
+            0x1F => out.push_str("%1F"),
+            0x20..=0x7E => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
 }
 
 fn pct_decode(raw: &str) -> Result<String, AccessError> {
-    let mut out = String::with_capacity(raw.len());
+    // Byte-oriented inverse of pct_encode: collect decoded bytes first so
+    // multi-byte UTF-8 sequences reassemble exactly, then validate UTF-8
+    // fail-closed (stored-row corruption never yields mojibake). Byte
+    // slicing avoids panics on crafted inputs that split UTF-8 boundaries.
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -617,18 +626,23 @@ fn pct_decode(raw: &str) -> Result<String, AccessError> {
                     detail: format!("truncated percent escape in '{raw}'"),
                 });
             }
-            let hex = &raw[i + 1..i + 3];
+            let hex_bytes = &bytes[i + 1..i + 3];
+            let hex = std::str::from_utf8(hex_bytes).map_err(|_| AccessError::InvalidRecord {
+                detail: format!("invalid percent escape in '{raw}'"),
+            })?;
             let byte = u8::from_str_radix(hex, 16).map_err(|_| AccessError::InvalidRecord {
                 detail: format!("invalid percent escape '%{hex}' in '{raw}'"),
             })?;
-            out.push(byte as char);
+            out.push(byte);
             i += 3;
         } else {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
     }
-    Ok(out)
+    String::from_utf8(out).map_err(|_| AccessError::InvalidRecord {
+        detail: format!("admission field is not valid UTF-8 in '{raw}'"),
+    })
 }
 
 fn synthetic_times() -> TimeTriple {
@@ -1213,6 +1227,11 @@ impl AccessGate {
         reason: &Reason,
     ) -> Result<Credential, AccessError> {
         let checked = self.check_credential(current, None)?;
+        // Fail closed like the enter paths: a revoked or stale credential
+        // must not rotate into a valid successor (no gen inflation, no
+        // revocation void, no holder DoS). No writes happen on refusal.
+        self.require_not_revoked(&checked)?;
+        self.require_current_generation(&checked)?;
         let next_gen = checked.max_gen + 1;
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let revoke = RevokeRow {
@@ -1837,14 +1856,27 @@ mod tests {
         for raw in [
             "synthetic bootstrap",
             "a;b=c%d",
-            "line\nbreak\rhereend",
+            "line\nbreak\rhere\u{1f}end",
             " Heslo ",
+            // Multi-byte UTF-8 must reassemble exactly (no mojibake).
+            "caf\u{e9}",
+            "synthetic caf\u{e9} \u{2615} na\u{ef}ve fa\u{e7}ade",
         ] {
             let encoded = pct_encode(raw);
+            // UTF-8-safe codec: the wire form stays ASCII-only.
+            assert!(
+                encoded.bytes().all(|b| b < 0x80),
+                "encoded must be ASCII-only: {encoded}"
+            );
             assert_eq!(pct_decode(&encoded).expect("decode"), raw);
         }
         assert!(pct_decode("%ZZ").is_err());
         assert!(pct_decode("%2").is_err());
+        // Lone non-UTF-8 byte fails closed (never mojibake).
+        assert_eq!(pct_decode("%FF").unwrap_err().code(), "invalid-record");
+        // Crafted escape that splits a UTF-8 boundary fails closed without
+        // panicking (byte-oriented hex parse).
+        assert!(pct_decode("%a\u{e9}").is_err());
     }
 
     #[test]
@@ -1877,6 +1909,33 @@ mod tests {
         let (kind, map) = decode_descriptor(&encoded).expect("decode");
         assert_eq!(kind, "revoke");
         assert_eq!(decode_revoke(&map).expect("revoke"), revoke);
+    }
+
+    #[test]
+    fn non_ascii_reason_and_label_round_trip_through_descriptor() {
+        // Reason/DisplayLabel::parse allow non-ASCII; the UTF-8-safe codec
+        // (option (a)) must preserve them exactly through the wire form.
+        let row = IssueRow {
+            cap: "reviewer-1".to_string(),
+            scope: "scope-a".to_string(),
+            ceiling: 1,
+            role: "reviewer".to_string(),
+            key_id: "key-reviewer-1".to_string(),
+            key_fp: "0123456789abcdef".to_string(),
+            issuer: "bootstrap-issuer-1".to_string(),
+            capgen: 1,
+            user: "synthetic-operator-1".to_string(),
+            reason: "synthetic caf\u{e9} rotation".to_string(),
+            label: "synth\u{e9}tique".to_string(),
+        };
+        let encoded = encode_issue(&row);
+        assert!(
+            encoded.bytes().all(|b| b < 0x80),
+            "wire form must stay ASCII-only: {encoded}"
+        );
+        let (kind, map) = decode_descriptor(&encoded).expect("decode");
+        assert_eq!(kind, "issue");
+        assert_eq!(decode_issue(&map).expect("issue"), row);
     }
 
     #[test]
