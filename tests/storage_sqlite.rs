@@ -619,7 +619,7 @@ fn maintenance_and_space_budgets_refuse_without_partials() {
     assert!(current_db > 0);
     drop(baseline);
 
-    // Operator-maintenance refusal: the live DB already exceeds the budget.
+    // Operator-maintenance refusal: live main + WAL + SHM exceed the budget.
     let mut tight = StoreBounds::tiny();
     tight.max_db_bytes = 1;
     let store = SqliteStore::open(
@@ -645,11 +645,11 @@ fn maintenance_and_space_budgets_refuse_without_partials() {
             .code(),
         "maintenance-required"
     );
-    drop(store);
+    let current_capacity = store.capacity_bytes(); drop(store);
 
     // Synthetic space exhaustion: budget fits today, not the next payload.
     let mut snug = StoreBounds::tiny();
-    snug.max_db_bytes = current_db;
+    snug.max_db_bytes = current_capacity;
     let store = SqliteStore::open(
         &scratch.db("tiny.db"),
         ConnectionSettings::local_wal_full(),

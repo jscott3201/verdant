@@ -29,7 +29,6 @@ use crate::domain::clock::{TimeTriple, UnixMillis};
 use crate::domain::ids::{InstalledId, OperationId, SourceGenerationId};
 use crate::domain::outcomes::RecordIdentity;
 use crate::domain::values::{Unit, Value};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -38,10 +37,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod admission;
 mod connection;
+mod execution;
+#[cfg(test)]
+mod execution_tests;
 mod mutation;
 #[cfg(test)]
 pub(crate) mod faults;
 pub use mutation::{MutationOutcome, PreparedMutation};
+pub use execution::ExecutionReport;
 use mutation::Shape;
 
 /// Column separator for the CLI envelope (unit separator; excluded from
@@ -206,6 +209,7 @@ struct Inner {
     sqlite_version: String,
     /// In-process handle budget for this store family (see `try_clone`).
     handles: AtomicU32,
+    execution: Arc<execution::ExecutionState>,
     /// Last operator checkpoint (epoch seconds; 0 = never this process).
     last_checkpoint_epoch_secs: AtomicU64,
 }
@@ -283,6 +287,13 @@ impl SqliteStore {
         &self.inner.bounds
     }
 
+    /// Running-operation and transport counters for this handle family.
+    pub fn execution_report(&self) -> ExecutionReport { self.inner.execution.report() }
+
+    fn operation(&self) -> Result<Arc<execution::Operation>, StorageError> {
+        execution::Operation::start(Arc::clone(&self.inner.execution), self.settings(), self.bounds())
+    }
+
     /// Exact `sqlite3` version string observed at open.
     pub fn sqlite_version(&self) -> &str {
         &self.inner.sqlite_version
@@ -329,12 +340,12 @@ impl SqliteStore {
         if let Some(reason) = self.maintenance_reason() {
             return Err(StorageError::MaintenanceRequired { detail: reason });
         }
-        let projected = self.db_size_bytes() + value_json.len() as u64;
+        let projected = self.capacity_bytes().saturating_add(value_json.len() as u64);
         if projected > self.inner.bounds.max_db_bytes {
             return Err(StorageError::SpaceExhausted {
                 detail: format!(
-                    "synthetic space budget: db {} bytes + {} payload bytes exceeds max_db_bytes {}",
-                    self.db_size_bytes(),
+                    "synthetic space budget: main + WAL + SHM {} bytes + {} payload bytes exceeds max_db_bytes {}",
+                    self.capacity_bytes(),
                     value_json.len(),
                     self.inner.bounds.max_db_bytes
                 ),
@@ -660,6 +671,14 @@ impl SqliteStore {
         self.inner.db_path.metadata().map(|m| m.len()).unwrap_or(0)
     }
 
+    /// Observed main + WAL + SHM bytes; not reserved space or a hard quota.
+    pub fn capacity_bytes(&self) -> u64 {
+        let mut shm = self.db_path().as_os_str().to_owned();
+        shm.push("-shm");
+        self.db_size_bytes().saturating_add(self.wal_size_bytes())
+            .saturating_add(std::fs::metadata(PathBuf::from(shm)).map(|m| m.len()).unwrap_or(0))
+    }
+
     /// Run one `BEGIN; <statements>; COMMIT;` batch with `.bail on`.
     ///
     /// Operator / fault-injection seam: the first failing statement aborts the
@@ -683,7 +702,7 @@ impl SqliteStore {
             body.push(' ');
         }
         body.push_str("COMMIT;");
-        let out = run_envelope(self.db_path(), self.settings(), &body)?;
+        let out = run_envelope(self.db_path(), self.settings(), &body, self.operation()?)?;
         let _ = out;
         Ok(())
     }
@@ -701,7 +720,7 @@ impl SqliteStore {
         // Test-only corruption/rollback seam. Product callers are privileged
         // crate internals and SQLite query_only prevents arbitrary mutation.
         #[cfg(test)]
-        { Ok(run_envelope(self.db_path(), self.settings(), script)?.body_rows) }
+        { Ok(run_envelope(self.db_path(), self.settings(), script, self.operation()?)?.body_rows) }
         #[cfg(not(test))]
         { Ok(self.exec_verified(script, false)?.body_rows) }
     }
@@ -725,10 +744,10 @@ impl SqliteStore {
                 self.inner.bounds.max_wal_bytes
             ));
         }
-        if self.db_size_bytes() > self.inner.bounds.max_db_bytes {
+        if self.capacity_bytes() > self.inner.bounds.max_db_bytes {
             return Some(format!(
-                "db {} bytes exceeds max_db_bytes {}: operator maintenance window is {} s",
-                self.db_size_bytes(),
+                "main + WAL + SHM {} bytes exceeds max_db_bytes {}: operator maintenance window is {} s",
+                self.capacity_bytes(),
                 self.inner.bounds.max_db_bytes,
                 self.inner.bounds.maintenance_window_secs
             ));
@@ -804,61 +823,23 @@ fn run_script_stdin(
     extra_args: &[&str],
     script: &str,
 ) -> Result<Output, StorageError> {
-    // No -noinit on 3.50.x; synthetic stdin runs use HOME without ~/.sqliterc.
-    let io_path = if db_path == Path::new(":memory:") { db_path.to_path_buf() }
-        else { connection::canonical_parent_path(db_path)? };
-    let mut child = Command::new("sqlite3")
-        .args(["-batch", "-nofollow"])
-        .args(extra_args)
-        .arg(&io_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::MissingSqlite {
-                    detail: "sqlite3 not found on PATH; system sqlite3 3.54.0 is required"
-                        .to_string(),
-                }
-            } else {
-                StorageError::Io {
-                    path: db_path.display().to_string(),
-                    message: format!("failed to spawn sqlite3: {e}"),
-                }
-            }
-        })?;
-    let full = format!(".bail on\n{script}\n");
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(full.as_bytes())
-            .map_err(|e| StorageError::Io {
-                path: db_path.display().to_string(),
-                message: format!("failed to feed sqlite3 stdin: {e}"),
-            })?;
-        // Close stdin so the child observes EOF (flush happens on drop);
-        // scripts are kilobytes, far below pipe-buffer deadlock territory.
-    }
-    let mut output = child.wait_with_output().map_err(|e| StorageError::Io {
-        path: db_path.display().to_string(),
-        message: format!("failed to collect sqlite3 output: {e}"),
-    })?;
-    output.stderr = String::from_utf8_lossy(&output.stderr)
-        .replace(io_path.to_string_lossy().as_ref(), db_path.to_string_lossy().as_ref()).into_bytes();
-    Ok(output)
+    let operation = execution::Operation::standalone(&ConnectionSettings::local_wal_full(), &StoreBounds::tiny())?;
+    execution::run_script(db_path, extra_args, script, operation)
 }
 
 fn run_envelope(
     db_path: &Path,
     settings: &ConnectionSettings,
     body: &str,
+    operation: Arc<execution::Operation>,
 ) -> Result<VerifiedOutput, StorageError> {
+    operation.check_input(body.len())?; // Refuse before cloning a caller script.
     let script = envelope_script(settings, body);
     let sep = COL_SEP.to_string();
     // Scripts travel on stdin, never argv: sqlite3 parses leading `-` argv
     // text as CLI options (migration headers start with `--`), while stdin
     // is always read as dot-commands/SQL.
-    let output = run_script_stdin(db_path, &["-separator", &sep], &script)?;
+    let output = execution::run_script(db_path, &["-separator", &sep], &script, operation)?;
     // Observed exit only: a stop (or pass) is never inferred from a timeout.
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1116,24 +1097,11 @@ fn validate_unit(unit: &Unit) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn sqlite_version() -> Result<String, StorageError> {
-    let output = Command::new("sqlite3")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::MissingSqlite {
-                    detail: "sqlite3 not found on PATH; system sqlite3 3.54.0 is required"
-                        .to_string(),
-                }
-            } else {
-                StorageError::Io {
-                    path: "sqlite3 --version".to_string(),
-                    message: format!("failed to spawn sqlite3: {e}"),
-                }
-            }
-        })?;
+fn sqlite_version(settings: &ConnectionSettings, bounds: &StoreBounds) -> Result<String, StorageError> {
+    let mut command = Command::new("sqlite3");
+    command.arg("--version");
+    let operation = execution::Operation::standalone(settings, bounds)?;
+    let output = execution::Process::spawn(command, Path::new("sqlite3 --version"), operation)?.collect(&[])?;
     if !output.status.success() {
         return Err(StorageError::MissingSqlite {
             detail: format!("sqlite3 --version exited with {}", output.status),
