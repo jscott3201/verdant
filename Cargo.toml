@@ -13,3 +13,16 @@ publish = false
 [[bin]]
 name = "verdant"
 path = "src/main.rs"
+
+# M01-PR05 native lifecycle (D02 amendment, owner-visible): this slice ENDS
+# the zero-dep era, minimally. Exactly one external dependency: the SeleneDB
+# `development` embedding facade at the pinned commit below (D05 record:
+# track `development` with exact-commit-per-validation discipline — this rev
+# is qualified ONLY for this validation; any bump needs re-qualification).
+# Mechanism is a git dependency at the EXACT pinned rev so public clones
+# reproduce it; never a path dependency (unreproducible), never vendored
+# sources. Default features only (no test-harness, no metrics, no wgpu/GPU,
+# no benchmark/opt-in surface): the facade lifecycle alone
+# (Database::create/open/checkpoint/prune + session execute).
+[dependencies]
+selene-db = { git = "https://github.com/jscott3201/selene-db.git", rev = "b65c2344c916d2c3ceeb72cefcd72e7960e95e25" }
