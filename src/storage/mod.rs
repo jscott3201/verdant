@@ -87,6 +87,9 @@ pub struct MigrationRecord {
 
 /// The 0001 change record. `predecessors` is empty: no other migration IDs
 /// exist and no other numbered migration may be created in this slice.
+/// Historical lock-space prose below is preserved, not a live quota promise:
+/// journal_size_limit trims a reset/checkpointed journal; readers can pin a
+/// larger WAL. Current observed budgets are documented on StoreBounds.
 pub const MIGRATION_0001: MigrationRecord = MigrationRecord {
     backend: "sqlite",
     owner: "M01-PR03",
@@ -129,8 +132,13 @@ pub struct ConnectionSettings {
     pub foreign_keys: &'static str,
     /// Busy timeout in milliseconds (also `PRAGMA busy_timeout` readout).
     pub busy_timeout_ms: u32,
-    /// WAL size cap applied via `PRAGMA journal_size_limit` (bytes).
+    /// Retained journal size after reset/checkpoint, NOT a live WAL hard cap.
     pub journal_size_limit_bytes: u64,
+    /// Absolute wall budget per CLI operation, including admission/retries,
+    /// stdin, computation, output and exit. Separate from SQLite lock waiting.
+    /// Composite open/report calls perform several individually bounded CLI
+    /// operations. Kernel spawn/kill/reap and scheduling are not real-time.
+    pub operation_timeout_ms: u64,
 }
 
 impl ConnectionSettings {
@@ -142,6 +150,7 @@ impl ConnectionSettings {
             foreign_keys: "1",
             busy_timeout_ms: 5_000,
             journal_size_limit_bytes: 8_388_608,
+            operation_timeout_ms: 35_000,
         }
     }
 }
@@ -150,12 +159,13 @@ impl fmt::Display for ConnectionSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "journal_mode={} synchronous=FULL({}) foreign_keys={} busy_timeout_ms={} journal_size_limit_bytes={}",
+            "journal_mode={} synchronous=FULL({}) foreign_keys={} busy_timeout_ms={} journal_size_limit_bytes={} operation_timeout_ms={}",
             self.journal_mode,
             self.synchronous_level,
             self.foreign_keys,
             self.busy_timeout_ms,
-            self.journal_size_limit_bytes
+            self.journal_size_limit_bytes,
+            self.operation_timeout_ms
         )
     }
 }
@@ -170,11 +180,23 @@ pub struct StoreBounds {
     pub max_replay_rows: u32,
     /// In-process handle budget per store family (`try_clone` refusal above).
     pub max_connections: u32,
+    /// Active CLI operations per shared handle family; refusal never queues.
+    /// Independent opens/processes are separate families (not a host limit).
+    pub max_running_operations: u32,
+    /// Cumulative stdin bytes per operation, including protocol and retries.
+    pub max_input_bytes: usize,
+    /// Combined stdout/stderr bytes per operation, including protocol/retries.
+    /// Fixed pipe-pump buffers may read ahead; no unbounded line allocation.
+    pub max_output_bytes: usize,
+    /// Cumulative stdout lines, including protocol, across an operation.
+    /// Full-history reads refuse overflow; they never return partial history.
+    pub max_output_rows: usize,
     /// Handoff channel capacity (bounded, counted; full channel refuses).
     pub max_tasks: usize,
-    /// WAL size cap mirrored into `journal_size_limit` (bytes).
+    /// Observed live WAL maintenance threshold, not a physical growth cap.
     pub max_wal_bytes: u64,
-    /// Synthetic space budget for the main DB file (bytes; insert refusal above).
+    /// Synthetic observed main + WAL + SHM capacity budget (insert refusal).
+    /// A transaction can overshoot; this is not a filesystem quota.
     pub max_db_bytes: u64,
     /// Explicit maintenance window in seconds (operator calls `checkpoint`).
     pub maintenance_window_secs: u64,
@@ -188,6 +210,10 @@ impl StoreBounds {
             max_value_bytes: 65_536,
             max_replay_rows: 64,
             max_connections: 16,
+            max_running_operations: 16,
+            max_input_bytes: 8_388_608,
+            max_output_bytes: 8_388_608,
+            max_output_rows: 8_192,
             max_tasks: 64,
             max_wal_bytes: 8_388_608,
             max_db_bytes: 67_108_864,
@@ -234,6 +260,12 @@ pub enum StorageError {
     Busy { detail: String },
     /// In-process handle budget (`max_connections`) exhausted.
     TooManyConnections { max: u32 },
+    /// Active operation budget exhausted before spawning a child.
+    TooManyRunningOperations { max: u32 },
+    /// Absolute operation deadline elapsed; never classified as lock busy.
+    DeadlineExceeded { timeout_ms: u64 },
+    /// Cumulative transport budget exceeded; no partial result is returned.
+    ExecutionLimit { resource: &'static str, max: usize },
     /// Bounded handoff channel full: the announcement is refused, never dropped.
     HandoffFull { capacity: usize },
     /// Filesystem I/O outside SQLite failed.
@@ -258,6 +290,9 @@ impl StorageError {
             StorageError::InvalidInput { .. } => "invalid-input",
             StorageError::Busy { .. } => "busy",
             StorageError::TooManyConnections { .. } => "too-many-connections",
+            StorageError::TooManyRunningOperations { .. } => "too-many-running-operations",
+            StorageError::DeadlineExceeded { .. } => "operation-deadline",
+            StorageError::ExecutionLimit { .. } => "execution-limit",
             StorageError::HandoffFull { .. } => "handoff-full",
             StorageError::Io { .. } => "io",
         }
@@ -314,6 +349,15 @@ impl fmt::Display for StorageError {
             }
             StorageError::TooManyConnections { max } => {
                 write!(f, "in-process handle budget exhausted (max {max})")
+            }
+            StorageError::TooManyRunningOperations { max } => {
+                write!(f, "running operation budget exhausted (max {max}); no child spawned")
+            }
+            StorageError::DeadlineExceeded { timeout_ms } => {
+                write!(f, "operation wall deadline exceeded ({timeout_ms} ms)")
+            }
+            StorageError::ExecutionLimit { resource, max } => {
+                write!(f, "operation {resource} budget exceeded (max {max}); partial result refused")
             }
             StorageError::HandoffFull { capacity } => {
                 write!(

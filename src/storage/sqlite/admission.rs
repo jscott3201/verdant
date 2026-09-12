@@ -3,6 +3,7 @@
 //! same-UID replacement of files while SQLite owns locks is not supported.
 use super::*;
 use super::connection::{failure, Connection};
+use super::execution::{ExecutionState, Operation};
 use std::fs::{self, OpenOptions};
 use std::sync::OnceLock;
 
@@ -125,7 +126,12 @@ pub(super) fn validate(conn: &mut Connection) -> Result<Option<String>, StorageE
 pub(super) fn open(path: &Path, settings: ConnectionSettings, bounds: StoreBounds) -> Result<(SqliteStore, OpenReport), StorageError> {
     validate_settings(&settings)?;
     let path = parent_path(path)?;
-    let version = sqlite_version()?;
+    let version = sqlite_version(&settings, &bounds)?;
+    // Populate the immutable reference before holding a database child. The
+    // bounded fixture never adds a second child to an admitted store operation.
+    // Reference construction uses fixed internal bounds, not caller budgets:
+    // a small open budget must not poison the process-wide reference cache.
+    reference_objects()?;
     if fs::symlink_metadata(&path).is_ok() {
         return existing(&path, settings, bounds, version);
     }
@@ -146,7 +152,7 @@ pub(super) fn open(path: &Path, settings: ConnectionSettings, bounds: StoreBound
 }
 
 fn initialize(path: &Path, settings: &ConnectionSettings, bounds: &StoreBounds, version: &str) -> Result<(String, StoreReport), StorageError> {
-    let mut conn = Connection::open(path)?;
+    let mut conn = Connection::open(path, Operation::standalone(settings, bounds)?)?;
     conn.configure(settings)?;
     conn.exchange("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;")?;
     conn.exchange(&format!("{}\nPRAGMA user_version=1; INSERT INTO schema_migrations VALUES (1, {});\n{}",
@@ -163,7 +169,7 @@ fn initialize(path: &Path, settings: &ConnectionSettings, bounds: &StoreBounds, 
 
 fn existing(path: &Path, settings: ConnectionSettings, bounds: StoreBounds, version: String) -> Result<(SqliteStore, OpenReport), StorageError> {
     let stamp = file_stamp(path)?;
-    let mut conn = Connection::open(path)?;
+    let mut conn = Connection::open(path, Operation::standalone(&settings, &bounds)?)?;
     conn.configure(&settings)?;
     // A read snapshot first: invalid stores are refused before writer admission
     // (including before enabling WAL). BEGIN IMMEDIATE revalidates below.
@@ -193,6 +199,7 @@ fn make_store(path: &Path, settings: ConnectionSettings, bounds: StoreBounds, sq
     Ok(SqliteStore { inner: Arc::new(Inner {
         db_path: path.to_path_buf(), settings, bounds, sqlite_version, identity,
         file_stamp: file_stamp(path)?, handles: AtomicU32::new(1),
+        execution: Arc::new(ExecutionState::default()),
         last_checkpoint_epoch_secs: AtomicU64::new(0),
     }) })
 }
@@ -201,6 +208,10 @@ struct PrivateFile(PathBuf);
 impl PrivateFile {
     fn new(path: &Path) -> Result<Self, StorageError> {
         let private = path.with_file_name(format!(".verdant-bootstrap-{}-{}-{}", std::process::id(), epoch_nanos_now(), super::mutation::next_sequence()));
+        Self::reserve(path, private)
+    }
+
+    fn reserve(path: &Path, private: PathBuf) -> Result<Self, StorageError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)] {
@@ -232,13 +243,18 @@ impl Drop for PrivateFile {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "probe_tests.rs"]
+mod probe_tests;
+
 impl SqliteStore {
     pub(super) fn admitted(&self, writer: bool) -> Result<Connection, StorageError> {
+        let operation = self.operation()?;
         for attempt in 0..=BUSY_RETRIES {
-            match self.admit_once(writer) {
+            match self.admit_once(writer, Arc::clone(&operation)) {
                 Err(StorageError::SqliteFailure { detail }) if is_busy_text(&detail) => {
                     if attempt == BUSY_RETRIES { return Err(StorageError::Busy { detail }); }
-                    std::thread::sleep(std::time::Duration::from_millis(BUSY_RETRY_PAUSE_MS));
+                    operation.pause(std::time::Duration::from_millis(BUSY_RETRY_PAUSE_MS))?;
                 }
                 result => return result,
             }
@@ -246,10 +262,11 @@ impl SqliteStore {
         Err(failure("admission retries exhausted"))
     }
 
-    fn admit_once(&self, writer: bool) -> Result<Connection, StorageError> {
+    fn admit_once(&self, writer: bool, operation: Arc<Operation>) -> Result<Connection, StorageError> {
+        operation.remaining()?;
         if file_stamp(self.db_path())? != self.inner.file_stamp { return Err(failure("database file identity changed")); }
         #[cfg(test)] super::faults::before_admission(self.db_path());
-        let mut conn = Connection::open(self.db_path())?;
+        let mut conn = Connection::open(self.db_path(), operation)?;
         conn.configure(&self.inner.settings)?;
         conn.exchange(if writer { "BEGIN IMMEDIATE;" } else { "BEGIN;" })?;
         if validate(&mut conn)?.as_deref() != Some(self.inner.identity.as_str()) {
@@ -329,7 +346,7 @@ mod tests {
             let error = open(&leaf, ConnectionSettings::local_wal_full(), StoreBounds::tiny()).unwrap_err();
             assert_eq!(error.code(), "sqlite-failure");
             // Exercise -nofollow itself too, not just the initial metadata check.
-            let error = Connection::open(&leaf).expect("spawn").exchange("SELECT 1;").unwrap_err();
+            let error = Connection::open(&leaf, Operation::standalone(&ConnectionSettings::local_wal_full(), &StoreBounds::tiny()).expect("budget")).expect("spawn").exchange("SELECT 1;").unwrap_err();
             let detail = error.to_string();
             assert!(detail.contains(leaf.to_str().expect("public path")), "{detail}");
             assert!(!detail.contains(scratch.0.join("real/leaf.db").to_str().expect("OS path")), "{detail}");
@@ -363,7 +380,7 @@ mod tests {
         assert!(scratch.entries().is_empty());
         assert!(!path.exists(), "Rust admission must not recreate a lost file");
         let missing = scratch.0.join("public/missing/store.db");
-        let error = Connection::open(&missing).err().expect("missing parent refusal");
+        let error = Connection::open(&missing, Operation::standalone(&ConnectionSettings::local_wal_full(), &StoreBounds::tiny()).expect("budget")).err().expect("missing parent refusal");
         assert!(matches!(error, StorageError::Io { path, .. } if path == missing.display().to_string()));
         let error = run_script_stdin(&missing, &[], "SELECT 1;").unwrap_err();
         assert!(matches!(error, StorageError::Io { path, .. } if path == missing.display().to_string()));
