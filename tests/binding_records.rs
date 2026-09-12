@@ -385,19 +385,19 @@ fn findings_carry_stable_id_and_generation_for_pr11() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn no_new_migration_binding_rows_reuse_0001_outbox() {
+fn migration_0002_receipts_coexist_with_generation_1_consumers() {
     let scratch = Scratch::new("migration");
     let (_gate, _creds) = open_gate(&scratch, "mig.db");
     let mut registry = open_registry(&scratch, "mig.db");
     seed_tiny(&mut registry);
-    // Exactly one numbered migration still.
+    // Storage protocol evolves without changing generation-1 event payloads.
     let mut migrations = Vec::new();
     for entry in std::fs::read_dir("migrations/sqlite").expect("migrations dir") {
         let entry = entry.expect("entry");
         migrations.push(entry.file_name().to_string_lossy().into_owned());
     }
     migrations.sort();
-    assert_eq!(migrations, vec!["0001_init.sql".to_string()]);
+    assert_eq!(migrations, vec!["0001_init.sql", "0002_receipts.sql"]);
     assert_eq!(storage::SCHEMA_GENERATION, 1);
     assert_eq!(binding::registry::BINDING_SCHEMA_GENERATION, 1);
     // Binding rows coexist with access rows in the same outbox.
@@ -408,6 +408,14 @@ fn no_new_migration_binding_rows_reuse_0001_outbox() {
     let total: u64 = rows[0][0].parse().expect("count parses");
     // 3 access rows (bootstrap) + 9 binding rows.
     assert_eq!(total, 12, "access + binding rows share the 0001 outbox");
+    let receipts = registry.store().exec_script("SELECT COUNT(*) FROM storage_receipts;").expect("receipts");
+    assert_eq!(receipts[0][0], "12", "receipts are separate, not outbox history");
+    drop(registry);
+    let registry = open_registry(&scratch, "mig.db");
+    assert_eq!(registry.revision().as_u32(), 9);
+    assert!(registry.equipment("ahu-1").is_some());
+    let gate = AccessGate::open(&scratch.db("mig.db"), storage::ConnectionSettings::local_wal_full(), storage::StoreBounds::tiny()).expect("access accepts upgraded store");
+    assert_eq!(gate.store().exec_script("SELECT COUNT(*) FROM outbox WHERE operation LIKE 'access-%';").expect("access rows")[0][0], "3");
 }
 
 #[test]
