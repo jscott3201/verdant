@@ -586,8 +586,7 @@ fn failure_differential_is_deterministic() {
 fn units_modes_and_slots_are_preserved_with_typed_refusals() {
     let profile = Profile::pinned();
 
-    // Unknown unit plus unknown mode round-trip as preserved unknowns, never
-    // coerced (PR02-frozen behavior consumed, not forked).
+    // PR02 preserves unknown tokens, but converter admission is closed.
     let turbo = OpMode::parse("turbo").expect("frozen unknown mode");
     assert!(turbo.is_unknown());
     let site = ExternalSite::new(vec![ExternalItem::parse(
@@ -600,13 +599,10 @@ fn units_modes_and_slots_are_preserved_with_typed_refusals() {
     )
     .expect("unknown unit and mode parse")])
     .expect("mode site is valid");
-    let conversion = convert(&site, &profile).expect("mode converts");
-    let binding = &conversion.bindings()[0];
-    assert!(binding.unit().is_unknown());
-    assert_eq!(binding.unit().as_str(), "furlongs-per-fortnight");
-    assert_eq!(binding.value(), &Value::Mode(turbo.clone()));
-    assert_eq!(mode_of(binding.value()), Some(&turbo));
-    assert_eq!(conversion.record().content_digest(), site.content_digest());
+    assert_eq!(convert(&site, &profile).unwrap_err().code(), "invalid-input");
+    assert!(site.items()[0].unit().is_unknown());
+    assert_eq!(site.items()[0].unit().as_str(), "furlongs-per-fortnight");
+    assert_eq!(mode_of(site.items()[0].value()), Some(&turbo));
 
     // Known mode stays known and mode_of reports it.
     let occupied = OpMode::parse("occupied").expect("known mode");

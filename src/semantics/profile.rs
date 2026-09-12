@@ -19,6 +19,9 @@
 //! Verdant namespace: `verdant:v1` with three kinds (`ahu`, `vav`,
 //! `sensor-sat`). Labels travel as text and never grant identity (both VAVs
 //! may carry `VAV`, like the domain fixture).
+//! Class names, units and modes are exact closed vocabularies, not synonym
+//! inference. Slot prefixes are not a registry of installed identities:
+//! `ahu-9` can convert but must still resolve to recorded point truth on import.
 //!
 //! ```ignore
 //! # use verdant_semantics_profile::{Profile, VerdantKind};
@@ -35,6 +38,11 @@ pub const PINNED_PROFILE_ID: &str = "verdant-pinned-brick-223p-rec-v1";
 
 /// Verdant namespace for v1 bindings (frozen).
 pub const VERDANT_NAMESPACE: &str = "verdant:v1";
+
+/// Closed converter vocabulary; independent of PR02 unknown preservation.
+pub const SUPPORTED_UNITS: [&str; 4] = ["degC", "percent", "Pa", "L/s"];
+/// Closed operating-mode vocabulary; applies only to `Value::Mode`.
+pub const SUPPORTED_MODES: [&str; 3] = ["occupied", "unoccupied", "standby"];
 
 /// Curated supported external classes (frozen, sorted for determinism).
 pub const SUPPORTED_AHU_CLASS: &str = "brick:AHU";
@@ -143,6 +151,23 @@ impl Profile {
     /// Borrow the Verdant namespace.
     pub fn namespace(self) -> &'static str {
         self.namespace
+    }
+
+    /// First inadmissible token, without coercing PR02's preserved unknowns.
+    pub(crate) fn unsupported_token<'a>(
+        self,
+        unit: &'a crate::domain::values::Unit,
+        value: &'a crate::domain::values::Value,
+    ) -> Option<(&'static str, &'a str)> {
+        if unit.is_unknown() || !SUPPORTED_UNITS.contains(&unit.as_str()) {
+            return Some(("unit", unit.as_str()));
+        }
+        if let crate::domain::values::Value::Mode(mode) = value {
+            if mode.is_unknown() || !SUPPORTED_MODES.contains(&mode.as_str()) {
+                return Some(("mode", mode.as_str()));
+            }
+        }
+        None
     }
 
     /// Classify one external class string (pure; never fetches).

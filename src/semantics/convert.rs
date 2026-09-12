@@ -28,25 +28,9 @@
 //! No `HashMap` iteration, no time, no randomness. Same input plus same
 //! profile yields byte-identical records and byte-identical failure JSON.
 //!
-//! ```ignore
-//! # use verdant_semantics_convert::{ExternalItem, ExternalSite, convert};
-//! # use verdant_semantics_profile::Profile;
-//! # use verdant_domain_values::{Unit, Value, Decimal};
-//! # // Crate names are illustrative; real tests wire via path.
-//! let profile = Profile::pinned();
-//! let item = ExternalItem::parse(
-//!     "ext-ahu-1",
-//!     "brick:AHU",
-//!     "ahu-1",
-//!     "AHU",
-//!     "degC",
-//!     Value::Decimal(Decimal::parse("21.50").expect("frozen decimal is valid")),
-//! )
-//! .expect("frozen positive item is valid");
-//! let site = ExternalSite::new(vec![item]).expect("single item site is valid");
-//! let conversion = convert(&site, &profile).expect("positive converts");
-//! assert_eq!(conversion.record().profile_id(), profile.id());
-//! ```
+//! PR02 unknown preservation is representation, not vocabulary admission.
+//! Conversion refuses units/modes outside the pinned closed lists; parsing
+//! still retains their original tokens. See `CONTRACT.md` for the seam.
 
 use super::profile::{ClassDecision, Profile, VerdantKind};
 use crate::domain::ids::{BindingRevision, InstalledId};
@@ -300,8 +284,8 @@ impl std::error::Error for SemanticsError {}
 /// Borrow the mode of a value when it carries one.
 ///
 /// This is the explicit [`OpMode`] consumption point: `Value::Mode` holds the
-/// frozen operating-mode example (known plus preserved unknown). All other
-/// value kinds carry no mode.
+/// frozen operating-mode example (including PR02 unknowns, which conversion
+/// refuses). All other value kinds carry no mode.
 pub fn mode_of(value: &Value) -> Option<&OpMode> {
     match value {
         Value::Missing => None,
@@ -333,7 +317,8 @@ impl ExternalItem {
     /// Refuses empty, over-long or out-of-alphabet source keys, classes and
     /// slots, empty labels, and invalid units with a typed error; never
     /// panics. Classification (supported vs out-of-scenario vs unknown) and
-    /// slot-kind consistency are checked by [`convert`], not here.
+    /// slot-kind consistency and closed unit/mode membership are checked by
+    /// [`convert`], not here.
     #[allow(clippy::too_many_arguments)]
     pub fn parse(
         source_key: &str,
@@ -801,8 +786,8 @@ impl ApplyOutcome {
 /// Pure and offline: takes `&` inputs, produces owned outputs, writes
 /// nothing. Order of checks is frozen for deterministic failures:
 /// classification (supported vs out-of-scenario vs unknown), then slot-kind
-/// consistency, then collision. The first failure in sorted source-key order
-/// wins, so the same input plus the same profile always yields the same
+/// consistency, then unit/mode vocabulary, then collision. The first failure
+/// in sorted source-key order wins; identical input/profile yields identical
 /// failure bytes.
 pub fn convert(site: &ExternalSite, profile: &Profile) -> Result<Conversion, SemanticsError> {
     let profile_id = profile.id().to_string();
@@ -837,6 +822,12 @@ pub fn convert(site: &ExternalSite, profile: &Profile) -> Result<Conversion, Sem
                     profile: profile_id,
                 });
             }
+        }
+        if let Some((what, token)) = profile.unsupported_token(item.unit(), item.value()) {
+            return Err(SemanticsError::InvalidInput {
+                what,
+                detail: format!("unsupported {what} '{token}' for profile '{profile_id}' (exact closed vocabulary)"),
+            });
         }
     }
 
