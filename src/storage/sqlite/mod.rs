@@ -369,7 +369,7 @@ impl SqliteStore {
             ingestion = sql_quote(&times.ingestion().as_millis().to_string()),
             generation = sql_quote(record.generation().as_str()),
             seq = sql_quote(&record.seq().to_string()),
-            now = "CAST(unixepoch('subsec') * 1000000000 AS TEXT)",
+            now = "CAST(unixepoch()*1000000000 + CAST(substr(strftime('%f','now'),4,3) AS INTEGER)*1000000 AS TEXT)",
         );
         let mut pending = PreparedMutation::new(self, &body, Shape::Insert)?;
         pending.payload_bytes = value_json.len();

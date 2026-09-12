@@ -334,7 +334,7 @@ fn credentialed_import_happy_path_persists_imported_and_replays_across_reopen() 
         .import_with_credential(
             &gate,
             Some(&creds.publisher),
-            &conversion,
+            &conversion, registry.revision(),
             "mstp://ahu-1",
             EndpointClass::Location,
             scope_a(),
@@ -354,7 +354,7 @@ fn credentialed_import_happy_path_persists_imported_and_replays_across_reopen() 
     assert_eq!(registry.revision().as_u32(), revision_before + 1);
     // Finding cites the post-import revision, exactly like propose.
     let finding = registry
-        .emit_finding(&imported, &creds.publisher)
+        .emit_finding(&gate, &imported, &creds.publisher)
         .expect("finding");
     assert_eq!(finding.binding_revision(), registry.revision());
     drop(registry);
@@ -398,7 +398,7 @@ fn credentialed_import_cross_scope_is_refused() {
         .import_with_credential(
             &gate,
             Some(&creds.publisher),
-            &conversion,
+            &conversion, registry.revision(),
             "mstp://vav-102",
             EndpointClass::Service,
             scope_b(),
@@ -416,7 +416,7 @@ fn credentialed_import_cross_scope_is_refused() {
         .import_with_credential(
             &gate,
             Some(&creds.publisher),
-            &conversion,
+            &conversion, registry.revision(),
             "mstp://vav-102",
             EndpointClass::Service,
             scope_a(),
@@ -451,7 +451,7 @@ fn credentialed_import_wrong_unit_and_class_against_truth_are_refused() {
         .import_with_credential(
             &gate,
             Some(&creds.publisher),
-            &wrong_unit,
+            &wrong_unit, registry.revision(),
             "mstp://ahu-1",
             EndpointClass::Location,
             scope_a(),
@@ -469,7 +469,7 @@ fn credentialed_import_wrong_unit_and_class_against_truth_are_refused() {
         .import_with_credential(
             &gate,
             Some(&creds.publisher),
-            &conversion,
+            &conversion, registry.revision(),
             "mstp://ahu-1",
             EndpointClass::Service,
             scope_a(),
@@ -507,7 +507,7 @@ fn credentialed_import_unknown_point_is_refused() {
         .import_with_credential(
             &gate,
             Some(&creds.publisher),
-            &unknown,
+            &unknown, registry.revision(),
             "mstp://ahu-9",
             EndpointClass::Location,
             scope_a(),
@@ -534,7 +534,7 @@ fn credentialed_import_revoked_and_over_ceiling_are_refused() {
         .import_with_credential(
             &gate,
             Some(&creds.reviewer),
-            &conversion,
+            &conversion, registry.revision(),
             "mstp://ahu-1",
             EndpointClass::Location,
             scope_a(),
@@ -553,7 +553,7 @@ fn credentialed_import_revoked_and_over_ceiling_are_refused() {
         .import_with_credential(
             &gate,
             Some(&creds.publisher),
-            &conversion,
+            &conversion, registry.revision(),
             "mstp://ahu-1",
             EndpointClass::Location,
             scope_a(),
@@ -602,7 +602,7 @@ fn credentialed_import_reassessment_address_is_refused() {
         .import_with_credential(
             &gate,
             Some(&creds.publisher),
-            &conversion,
+            &conversion, registry.revision(),
             "mstp://vav-101",
             EndpointClass::Service,
             scope_a(),

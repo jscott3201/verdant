@@ -2,9 +2,9 @@
 //!
 //! A [`Finding`] is the referenceable record later work cites without M03:
 //! a deterministic [`FindingId`] plus a `generation` (the binding revision
-//! at emission) plus the content digest and the capability fingerprint that
+//! at emission) plus the content digest and the stable actor reference that
 //! scopes it. Findings are additive and content-addressed: the same binding,
-//! revision and fingerprint always yield the same id, so PR11 can re-derive
+//! revision and actor reference always yield the same id, so PR11 can re-derive
 //! and cite them without re-running qualification.
 //!
 //! PR11 entry points (stable):
@@ -13,9 +13,8 @@
 //! * [`Finding::id`] / [`Finding::generation`] — the citable pair.
 //! * [`Finding::binding_revision`] / [`Finding::digest`] / [`Finding::summary`] —
 //!   the sealed content.
-//! * [`capability_fingerprint`] — the capability fingerprint entry point
-//!   (delegates to the synthetic key fingerprint; raw key never leaves the
-//!   caller).
+//! The pure derivation is not authorization. Only the registry writer joins a
+//! live access report to durable emission. No key fingerprint scopes v2 findings.
 
 use super::error::BindingError;
 use super::proposal::ProposedBinding;
@@ -81,39 +80,39 @@ pub struct Finding {
     revision: BindingRevision,
     digest: String,
     summary: String,
-    capability_fp: String,
+    actor_reference: String,
 }
 
 impl Finding {
     /// Derive the stable finding for one binding at `revision`, scoped to
-    /// the capability fingerprint `capability_fp`.
+    /// the stable actor-reference bytes (not authentication or permission).
     ///
     /// Deterministic: same binding bytes plus same revision plus same
-    /// fingerprint always yield the same id and digest. The `generation`
+    /// actor reference always yield the same id and digest. The `generation`
     /// equals `revision.as_u32()` so PR11 cites `(id, generation)` without
     /// M03.
     pub fn for_binding(
         binding: &ProposedBinding,
         revision: BindingRevision,
-        capability_fp: &str,
+        actor_reference: &str,
     ) -> Finding {
         let canonical = format!(
             "{}\x1f{}\x1f{}",
             binding.canonical_bytes(),
             revision.as_u32(),
-            capability_fp
+            actor_reference
         );
         let digest = fnv1a_hex(canonical.as_bytes());
         let id_text = format!("finding-{digest}");
         let generation = revision.as_u32();
         let summary = format!(
-            "binding {}:{} {} [{}] rev {} fp {}",
+            "binding {}:{} {} [{}] rev {} actor {}",
             binding.point_equipment().as_str(),
             binding.point_property().as_str(),
             binding.status().as_str(),
             binding.unit().as_str(),
             revision.as_u32(),
-            capability_fp,
+            actor_reference,
         );
         Finding {
             id: FindingId(id_text),
@@ -121,7 +120,7 @@ impl Finding {
             revision,
             digest,
             summary,
-            capability_fp: capability_fp.to_string(),
+            actor_reference: actor_reference.to_string(),
         }
     }
 
@@ -150,9 +149,9 @@ impl Finding {
         &self.summary
     }
 
-    /// Borrow the scoping capability fingerprint.
-    pub fn capability_fingerprint_text(&self) -> &str {
-        &self.capability_fp
+    /// Borrow the stable scoping actor reference (never key material).
+    pub fn actor_reference_text(&self) -> &str {
+        &self.actor_reference
     }
 
     /// Rebuild a finding from stored fields (registry replay only).
@@ -165,7 +164,7 @@ impl Finding {
         revision: BindingRevision,
         digest: String,
         summary: String,
-        capability_fp: String,
+        actor_reference: String,
     ) -> Finding {
         Finding {
             id,
@@ -173,16 +172,7 @@ impl Finding {
             revision,
             digest,
             summary,
-            capability_fp,
+            actor_reference,
         }
     }
-}
-
-/// Capability fingerprint entry point for PR11 seals.
-///
-/// Delegates to the synthetic key fingerprint recorded by PR04; the raw key
-/// never leaves the caller and is never logged. The fingerprint alone grants
-/// nothing: it scopes a finding to the credential that proposed it.
-pub fn capability_fingerprint(credential: &crate::access::Credential) -> String {
-    credential.key().fingerprint()
 }

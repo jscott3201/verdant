@@ -352,7 +352,7 @@ fn findings_carry_stable_id_and_generation_for_pr11() {
         )
         .expect("propose");
     let first = registry
-        .emit_finding(&binding, &creds.publisher)
+        .emit_finding(&gate, &binding, &creds.publisher)
         .expect("finding");
     // Citable pair: id plus generation (generation equals the revision).
     assert!(first.id().as_str().starts_with("finding-"));
@@ -360,21 +360,21 @@ fn findings_carry_stable_id_and_generation_for_pr11() {
     assert_eq!(first.binding_revision(), registry.revision());
     assert!(!first.digest().is_empty());
     assert!(!first.summary().is_empty());
-    // Fingerprint scopes the finding to the proposing credential.
+    // Stable actor reference scopes the finding; no key fingerprint persists.
     assert_eq!(
-        first.capability_fingerprint_text(),
-        creds.publisher.key().fingerprint()
+        first.actor_reference_text(),
+        "capability=publisher-1;scope=scope-a;capgen=1;issuer=bootstrap-issuer-1"
     );
     assert_eq!(
-        first.capability_fingerprint_text(),
-        binding::capability_fingerprint(&creds.publisher)
+        first.actor_reference_text(),
+        "capability=publisher-1;scope=scope-a;capgen=1;issuer=bootstrap-issuer-1"
     );
-    // Deterministic: same binding, revision and fingerprint re-derive the
+    // Deterministic: same binding, revision and actor reference re-derive the
     // same id and digest.
     let again = binding::Finding::for_binding(
         &binding,
         registry.revision(),
-        &creds.publisher.key().fingerprint(),
+        "capability=publisher-1;scope=scope-a;capgen=1;issuer=bootstrap-issuer-1",
     );
     assert_eq!(again.id(), first.id());
     assert_eq!(again.digest(), first.digest());
@@ -443,7 +443,7 @@ fn history_replays_across_reopen_with_retirement_intact() {
         )
         .expect("propose");
     let finding = registry
-        .emit_finding(&binding, &creds.publisher)
+        .emit_finding(&gate, &binding, &creds.publisher)
         .expect("finding");
     let finding_id = finding.id().as_str().to_string();
     registry

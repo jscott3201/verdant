@@ -400,7 +400,7 @@ mod finding_identity_regressions {
         );
         assert_eq!(legacy.generation(), 7);
         assert_eq!(legacy.binding_revision(), revision);
-        assert_eq!(legacy.capability_fingerprint_text(), "fixture-fingerprint");
+        assert_eq!(legacy.actor_reference_text(), "fixture-fingerprint");
         assert_ne!(legacy.id(), Finding::for_binding(&binding, revision, "fixture-fingerprint").id());
     }
 

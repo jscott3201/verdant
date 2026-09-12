@@ -36,12 +36,11 @@
 //! reserved `binding-*` operations (PR04 pattern). `0002_binding.sql` is
 //! NOT created: the outbox already carries `(operation, entity, sensor,
 //! value_json, unit, times, generation, seq, status)` with exactly the
-//! shape binding history needs (ordered, durable, per-connection verified),
-//! `SCHEMA_GENERATION` stays `1`, and the reservation test still observes
-//! exactly one numbered migration. A future slice that outgrows the outbox
-//! (for example, horizon-bounded replay past `max_replay_rows`) must
-//! reserve `0002` through the integration owner; applied migrations are
-//! never rewritten.
+//! shape binding history needs (ordered, durable, per-connection verified).
+//! `SCHEMA_GENERATION` stays `1`; R03's existing `0002_receipts` supplies
+//! operation identity and reconciliation. R06 adds no migration. Full registry
+//! reconstruction and explicit bounded observation windows are separate APIs;
+//! a truncated window can never become mutation truth.
 //!
 //! Native (Selene) persistence was considered and declined: per D05 the
 //! Selene pin carries no persisted-data compat across builds (treat native
@@ -94,8 +93,13 @@
 //!   revision at emission).
 //! * [`registry::BindingRegistry::revision`] — the binding revision
 //!   (PR02 [`BindingRevision`](crate::domain::ids::BindingRevision)).
-//! * [`findings::capability_fingerprint`] — the capability fingerprint
-//!   entry point (synthetic key fingerprint; raw key never stored/logged).
+//! * [`findings::Finding::actor_reference_text`] — stable capability, scope,
+//!   capability generation and issuer, joined from a live R05 entry report.
+//!
+//! R06 descriptor decision: v2 only (including record rows); v1 databases are
+//! refused, not silently upgraded. Binding revision/sequence and the row commit
+//! together behind the R03 guarded receipt boundary. No cached actor grants a
+//! mutation, and pure `propose`/`import_binding` remain independent of storage.
 
 pub mod error;
 pub mod findings;
@@ -104,10 +108,14 @@ pub mod import;
 pub mod proposal;
 pub mod records;
 pub mod registry;
+pub mod writer;
+mod authority;
 
 pub use error::BindingError;
 #[allow(unused_imports)]
-pub use findings::{capability_fingerprint, Finding, FindingId};
+pub use findings::{Finding, FindingId};
+#[allow(unused_imports)]
+pub use writer::{PendingProposal, ProposalCommit};
 #[allow(unused_imports)]
 pub use import::{import_binding, import_diagnostic, import_site};
 #[allow(unused_imports)]
@@ -266,31 +274,4 @@ pub(crate) fn require_field(
         .ok_or_else(|| BindingError::InvalidRecord {
             detail: format!("binding descriptor missing field '{key}'"),
         })
-}
-
-pub(crate) fn insert_binding_row(
-    store: &crate::storage::sqlite::SqliteStore,
-    operation: &str,
-    entity: &crate::domain::ids::InstalledId,
-    descriptor: &str,
-    seq: u64,
-) -> Result<(), BindingError> {
-    let op = crate::domain::ids::OperationId::parse(operation).map_err(|e| {
-        BindingError::InvalidRecord {
-            detail: format!("reserved binding operation invalid: {e}"),
-        }
-    })?;
-    let value = crate::domain::values::Value::Text(descriptor.to_string());
-    store
-        .insert(
-            &op,
-            entity,
-            &frozen_sensor(),
-            &value,
-            &binding_unit(),
-            synthetic_times(),
-            &synthetic_record(seq),
-        )
-        .map_err(BindingError::Store)?;
-    Ok(())
 }
