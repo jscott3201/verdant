@@ -24,13 +24,13 @@ mod binding;
 
 use access::{AccessGate, Reason};
 use binding::{
-    import_diagnostic, import_site, BindingRegistry, BindingRole, EndpointClass, EquipmentKind,
-    Feedback,
+    import_diagnostic, import_site, BindingRegistry, BindingRole, BindingStatus, EndpointClass,
+    EquipmentKind, Feedback,
 };
 use domain::scope::TrustedScope;
 use domain::values::{Unit, Value};
 use semantics::convert::{ExternalItem, ExternalSite};
-use semantics::profile::{Profile, SUPPORTED_SAT_CLASS, SUPPORTED_VAV_CLASS};
+use semantics::profile::{Profile, SUPPORTED_AHU_CLASS, SUPPORTED_SAT_CLASS, SUPPORTED_VAV_CLASS};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -69,6 +69,9 @@ fn reason(test: &str) -> Reason {
 }
 fn scope_a() -> TrustedScope {
     TrustedScope::parse("scope-a").expect("frozen scope-a")
+}
+fn scope_b() -> TrustedScope {
+    TrustedScope::parse("scope-b").expect("frozen scope-b")
 }
 fn open_gate(scratch: &Scratch, name: &str) -> (AccessGate, access::BootstrapCredentials) {
     AccessGate::bootstrap(
@@ -288,4 +291,328 @@ fn bindings_never_authorize_actuation_from_class_or_address_alone() {
     assert!(gate
         .enter_publish(Some(&creds.reviewer), &scope_a())
         .is_err());
+}
+// ARCH-1: credentialed imports anchor to recorded point truth, exactly
+// like propose. The conversion's verdant slot plus the point property
+// locate the stored PointRecord; unit/class/scope and capability all check
+// against that stored truth. Caller-supplied expectations cannot smuggle a
+// cross-scope binding past the gate.
+fn ahu_conversion(unit_text: &str) -> semantics::convert::Binding {
+    let profile = Profile::pinned();
+    let item = ExternalItem::parse(
+        "ext-ahu-1",
+        SUPPORTED_AHU_CLASS,
+        "ahu-1",
+        "AHU",
+        unit_text,
+        Value::Missing,
+    )
+    .expect("ahu item parses; unit is preserved verbatim");
+    let site = ExternalSite::new(vec![item]).expect("site");
+    let conversion = import_site(&site, &profile).expect("ahu converts");
+    assert_eq!(conversion.bindings().len(), 1);
+    conversion.bindings()[0].clone()
+}
+fn vav_conversion(slot: &str, key: &str) -> semantics::convert::Binding {
+    let profile = Profile::pinned();
+    let item = ExternalItem::parse(key, SUPPORTED_VAV_CLASS, slot, "VAV", "L/s", Value::Missing)
+        .expect("vav item parses");
+    let site = ExternalSite::new(vec![item]).expect("site");
+    let conversion = import_site(&site, &profile).expect("vav converts");
+    assert_eq!(conversion.bindings().len(), 1);
+    conversion.bindings()[0].clone()
+}
+#[test]
+fn credentialed_import_happy_path_persists_imported_and_replays_across_reopen() {
+    let scratch = Scratch::new("cred-import-ok");
+    let (gate, creds) = open_gate(&scratch, "ci-ok.db");
+    let mut registry = open_registry(&scratch, "ci-ok.db");
+    seed_tiny(&mut registry);
+    let conversion = ahu_conversion("degC");
+    let revision_before = registry.revision().as_u32();
+    let imported = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.publisher),
+            &conversion,
+            "mstp://ahu-1",
+            EndpointClass::Location,
+            scope_a(),
+            "supply-air-temp",
+            "sensor-sat-1",
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+        )
+        .expect("anchored import proposes");
+    assert_eq!(imported.status(), BindingStatus::Imported);
+    assert_eq!(imported.unit().as_str(), "degC");
+    assert_eq!(imported.point_equipment().as_str(), "ahu-1");
+    assert_eq!(imported.point_property().as_str(), "supply-air-temp");
+    assert_eq!(imported.point_scope().as_str(), "scope-a");
+    assert_eq!(registry.bindings().len(), 1);
+    assert_eq!(registry.revision().as_u32(), revision_before + 1);
+    // Finding cites the post-import revision, exactly like propose.
+    let finding = registry
+        .emit_finding(&imported, &creds.publisher)
+        .expect("finding");
+    assert_eq!(finding.binding_revision(), registry.revision());
+    drop(registry);
+    let reopened = open_registry(&scratch, "ci-ok.db");
+    assert_eq!(reopened.bindings().len(), 1);
+    assert_eq!(reopened.bindings()[0].status(), BindingStatus::Imported);
+    assert_eq!(reopened.bindings()[0].unit().as_str(), "degC");
+    assert_eq!(reopened.findings().len(), 1);
+}
+#[test]
+fn credentialed_import_cross_scope_is_refused() {
+    let scratch = Scratch::new("cred-import-xscope");
+    let (gate, creds) = open_gate(&scratch, "ci-xs.db");
+    let mut registry = open_registry(&scratch, "ci-xs.db");
+    seed_tiny(&mut registry);
+    // Scope-b point truth exists; the scope-a-only publisher must not persist
+    // it no matter which endpoint scope the caller claims.
+    registry
+        .record_equipment(
+            "vav-102",
+            EquipmentKind::Vav,
+            scope_b(),
+            "VAV",
+            "mstp://vav-102",
+        )
+        .expect("scope-b equipment");
+    registry
+        .record_point(
+            "vav-102",
+            "airflow",
+            scope_b(),
+            "L/s",
+            EndpointClass::Service,
+        )
+        .expect("scope-b point");
+    let conversion = vav_conversion("vav-102", "ext-vav-102");
+    let revision_before = registry.revision();
+    // Caller claims the endpoint lives in scope-b (structurally consistent
+    // with the stored point): the STORED-scope capability check still fails.
+    let err = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.publisher),
+            &conversion,
+            "mstp://vav-102",
+            EndpointClass::Service,
+            scope_b(),
+            "airflow",
+            "sensor-sat-1",
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "scope-denied");
+    // Caller claims the endpoint lives in scope-a instead: the
+    // endpoint-vs-stored scope check fails first.
+    let err = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.publisher),
+            &conversion,
+            "mstp://vav-102",
+            EndpointClass::Service,
+            scope_a(),
+            "airflow",
+            "sensor-sat-1",
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "scope-denied");
+    // Neither refusal persisted a binding, bumped the revision, or left a
+    // replayable row behind.
+    assert_eq!(registry.bindings().len(), 0);
+    assert_eq!(registry.revision(), revision_before);
+    drop(registry);
+    let reopened = open_registry(&scratch, "ci-xs.db");
+    assert_eq!(reopened.bindings().len(), 0);
+    assert_eq!(reopened.revision(), revision_before);
+}
+#[test]
+fn credentialed_import_wrong_unit_and_class_against_truth_are_refused() {
+    let scratch = Scratch::new("cred-import-truth");
+    let (gate, creds) = open_gate(&scratch, "ci-truth.db");
+    let mut registry = open_registry(&scratch, "ci-truth.db");
+    seed_tiny(&mut registry);
+    // Stored truth is degC + Location for ahu-1:supply-air-temp. A
+    // conversion carrying percent refuses against truth (wrong-unit), even
+    // though the caller cannot override the expectation anymore.
+    let wrong_unit = ahu_conversion("percent");
+    let err = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.publisher),
+            &wrong_unit,
+            "mstp://ahu-1",
+            EndpointClass::Location,
+            scope_a(),
+            "supply-air-temp",
+            "sensor-sat-1",
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "wrong-unit");
+    // Same stored truth with a Service endpoint refuses (endpoint-confusion).
+    let conversion = ahu_conversion("degC");
+    let err = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.publisher),
+            &conversion,
+            "mstp://ahu-1",
+            EndpointClass::Service,
+            scope_a(),
+            "supply-air-temp",
+            "sensor-sat-1",
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "endpoint-confusion");
+    assert_eq!(registry.bindings().len(), 0);
+}
+#[test]
+fn credentialed_import_unknown_point_is_refused() {
+    let scratch = Scratch::new("cred-import-unknown");
+    let (gate, creds) = open_gate(&scratch, "ci-unk.db");
+    let mut registry = open_registry(&scratch, "ci-unk.db");
+    seed_tiny(&mut registry);
+    // ahu-9 converts (slot prefix matches) but no point was ever recorded.
+    let profile = Profile::pinned();
+    let item = ExternalItem::parse(
+        "ext-ahu-9",
+        SUPPORTED_AHU_CLASS,
+        "ahu-9",
+        "AHU",
+        "degC",
+        Value::Missing,
+    )
+    .expect("ahu-9 parses; refused at import");
+    let site = ExternalSite::new(vec![item]).expect("site");
+    let conversion = import_site(&site, &profile).expect("ahu-9 converts");
+    let unknown = conversion.bindings()[0].clone();
+    let err = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.publisher),
+            &unknown,
+            "mstp://ahu-9",
+            EndpointClass::Location,
+            scope_a(),
+            "supply-air-temp",
+            "sensor-sat-1",
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid-record");
+    assert_eq!(registry.bindings().len(), 0);
+}
+#[test]
+fn credentialed_import_revoked_and_over_ceiling_are_refused() {
+    let scratch = Scratch::new("cred-import-cap");
+    let (gate, creds) = open_gate(&scratch, "ci-cap.db");
+    let mut registry = open_registry(&scratch, "ci-cap.db");
+    seed_tiny(&mut registry);
+    let conversion = ahu_conversion("degC");
+    // Reviewer (review-grade ceiling) cannot cover a Drive import: the
+    // stored-scope capability check maps to wrong-role, as in propose.
+    let err = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.reviewer),
+            &conversion,
+            "mstp://ahu-1",
+            EndpointClass::Location,
+            scope_a(),
+            "supply-air-temp",
+            "sensor-sat-1",
+            BindingRole::Drive,
+            BindingRole::Drive,
+            Feedback::Absent,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "wrong-role");
+    // Revoked publisher cannot import even a well-formed Sense binding.
+    gate.revoke(&creds.publisher, &reason("revoke-pub-import"))
+        .expect("revoke");
+    let err = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.publisher),
+            &conversion,
+            "mstp://ahu-1",
+            EndpointClass::Location,
+            scope_a(),
+            "supply-air-temp",
+            "sensor-sat-1",
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "capability-denied");
+    assert_eq!(registry.bindings().len(), 0);
+}
+#[test]
+fn credentialed_import_reassessment_address_is_refused() {
+    let scratch = Scratch::new("cred-import-reassess");
+    let (gate, creds) = open_gate(&scratch, "ci-re.db");
+    let mut registry = open_registry(&scratch, "ci-re.db");
+    seed_tiny(&mut registry);
+    registry
+        .retire("vav-101", "synthetic swap")
+        .expect("retire");
+    registry
+        .record_equipment(
+            "vav-103",
+            EquipmentKind::Vav,
+            scope_a(),
+            "VAV",
+            "mstp://vav-101",
+        )
+        .expect("replacement");
+    registry
+        .record_point(
+            "vav-103",
+            "airflow",
+            scope_a(),
+            "L/s",
+            EndpointClass::Service,
+        )
+        .expect("replacement point");
+    assert!(registry.needs_reassessment("vav-103"));
+    let conversion = vav_conversion("vav-103", "ext-vav-103");
+    // Reassessment is checked before capability, as in propose: even the
+    // publisher is refused here.
+    let err = registry
+        .import_with_credential(
+            &gate,
+            Some(&creds.publisher),
+            &conversion,
+            "mstp://vav-101",
+            EndpointClass::Service,
+            scope_a(),
+            "airflow",
+            "sensor-sat-1",
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "needs-reassessment");
+    assert_eq!(registry.bindings().len(), 0);
 }

@@ -32,6 +32,13 @@ use crate::domain::values::Unit;
 /// Structural checks (scope, endpoint class, unit, roles, feedback) run
 /// exactly as in [`propose`](super::proposal::propose); success yields
 /// [`BindingStatus::Imported`] (not `Valid`: import is not validation).
+///
+/// This is a pure structural map: it does not look up records and does not
+/// authenticate. The credentialed registry entry point
+/// ([`BindingRegistry::import_with_credential`](super::registry::BindingRegistry::import_with_credential))
+/// must supply the STORED point scope/unit/class as the `point_scope` /
+/// `expected_*` arguments (loaded from the recorded point truth); passing
+/// caller-chosen expectations here grants nothing on its own.
 #[allow(clippy::too_many_arguments)]
 pub fn import_binding(
     conversion: &crate::semantics::convert::Binding,

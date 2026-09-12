@@ -423,12 +423,24 @@ impl BindingRegistry {
         Ok(binding)
     }
 
-    /// Capability-gated import of one PR06 conversion binding.
+    /// Capability-gated import of one PR06 conversion binding, anchored to
+    /// recorded point truth exactly like
+    /// [`propose_with_credential`](Self::propose_with_credential).
     ///
-    /// The conversion unit/value/label are preserved verbatim; structural
-    /// and capability checks run as in
-    /// [`propose_with_credential`](Self::propose_with_credential). Success
-    /// persists the imported binding (`imported`, not `valid`).
+    /// The conversion unit/value/label are preserved verbatim. The stored
+    /// [`PointRecord`](super::records::PointRecord) keyed by
+    /// `(conversion.verdant_id, point_property)` supplies the expected unit,
+    /// endpoint class and scope: unknown points are refused
+    /// (`invalid-record`), conversion-unit vs stored-unit mismatches are
+    /// refused (`wrong-unit`), endpoint-class vs stored-class mismatches are
+    /// refused (`endpoint-confusion`), and endpoint-scope vs stored-scope
+    /// mismatches are refused (`scope-denied`). The capability check runs
+    /// against the STORED scope. Reassessment is checked before capability,
+    /// as in propose. Caller-supplied `expected_*` / `point_scope`
+    /// parameters were removed in the ARCH-1 repair: they were
+    /// self-referential (both sides caller-controlled) and must never decide
+    /// authorization. Success persists the imported binding (`imported`, not
+    /// `valid`).
     #[allow(clippy::too_many_arguments)]
     pub fn import_with_credential(
         &mut self,
@@ -439,35 +451,49 @@ impl BindingRegistry {
         endpoint_class: EndpointClass,
         endpoint_scope: TrustedScope,
         point_property: &str,
-        point_scope: TrustedScope,
         source_text: &str,
-        expected_point_unit: &Unit,
-        expected_point_class: EndpointClass,
         requested: BindingRole,
         effective: BindingRole,
         feedback: Feedback,
     ) -> Result<ProposedBinding, BindingError> {
+        let verdant_id = conversion.verdant_id().as_str().to_string();
+        let key = format!("{verdant_id}:{point_property}");
+        let stored = self
+            .points
+            .get(&key)
+            .ok_or_else(|| BindingError::InvalidRecord {
+                detail: format!("unknown point '{key}'; record the point before importing"),
+            })?;
+        let expected_unit = stored.unit().clone();
+        let expected_class = stored.endpoint_class();
+        let point_scope = stored.scope().clone();
+        if self.reassessment.contains(verdant_id.as_str()) {
+            let addr = self
+                .equipment
+                .get(verdant_id.as_str())
+                .map(|r| r.address().as_str().to_string())
+                .unwrap_or_else(|| endpoint_address.to_string());
+            return Err(BindingError::NeedsReassessment {
+                id: verdant_id,
+                address: addr,
+                detail: "replacement at a retired address needs fresh qualification; old history retained, not overwritten"
+                    .to_string(),
+            });
+        }
         let imported = super::import::import_binding(
             conversion,
             endpoint_address,
             endpoint_class,
-            endpoint_scope.clone(),
+            endpoint_scope,
             point_property,
             point_scope.clone(),
             source_text,
-            expected_point_unit,
-            expected_point_class,
+            &expected_unit,
+            expected_class,
             requested,
             effective,
             feedback,
         )?;
-        if self.reassessment.contains(conversion.verdant_id().as_str()) {
-            return Err(BindingError::NeedsReassessment {
-                id: conversion.verdant_id().as_str().to_string(),
-                address: endpoint_address.to_string(),
-                detail: "replacement at a retired address needs fresh qualification".to_string(),
-            });
-        }
         Self::check_capability(gate, credential, &point_scope, requested)?;
         let entity = imported.point_equipment().clone();
         let mode_text = imported.mode().map(|m| m.as_str()).unwrap_or("-");
