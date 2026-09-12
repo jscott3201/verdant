@@ -44,9 +44,9 @@ pub mod sqlite;
 
 /// Schema generation bound to every prepared statement in this slice.
 ///
-/// All SQL text derives from `migrations/sqlite/0001_init.sql`; the store
-/// records `PRAGMA user_version = 1` and refuses to run statements against any
-/// other generation ([`StorageError::SchemaMismatch`]).
+/// The outbox row contract remains 1: additive migration 0002 changes no
+/// access/binding payloads. The separate migration ledger + application_id
+/// bind the storage protocol; unknown/downgraded combinations are refused.
 pub const SCHEMA_GENERATION: u32 = 1;
 
 /// Reserved migration identifier for this slice's initial schema.
@@ -99,6 +99,22 @@ pub const MIGRATION_0001: MigrationRecord = MigrationRecord {
     interruption: "uncommitted work never survives; claimed-unacked rows stay visibly dangling, never silently requeued",
     read_write_policy: "per-connection WAL + FULL-sync + foreign-keys + busy-timeout, set and re-read in-band",
     rollback_boundary: "applied migrations never rewritten; data rollback is explicit per-row; no down migration",
+};
+
+/// Additive storage-protocol revision; generation-1 consumers remain valid.
+pub const MIGRATION_0002_SQL: &str = include_str!("../../migrations/sqlite/0002_receipts.sql");
+pub const MIGRATION_0002: MigrationRecord = MigrationRecord {
+    backend: "sqlite",
+    owner: "R03",
+    id: "0002_receipts",
+    predecessors: &["0001_init"],
+    fresh_install: "0001 plus 0002 in one private transaction; validate and close before no-clobber publication",
+    supported_upgrade: "validated 0001 to 0002 in one writer transaction; backfill one legacy receipt per existing row without inventing transition outcomes",
+    queued_msg_compat: "unchanged additive outbox; receipts in their own table; generation-1 access/binding consumers accept",
+    lock_space: "BEGIN IMMEDIATE; WAL/FULL; additional receipt storage; no automatic receipt pruning",
+    interruption: "atomic upgrade rollback; unpublished bootstrap files are never adopted; ambiguous commits require same-identity reconciliation",
+    read_write_policy: "user_version stays 1; ledger revision 2 plus application_id and store identity enforced in the owning connection",
+    rollback_boundary: "no downgrade; unknown/incomplete ledger, objects or identity refused without repair",
 };
 
 /// Per-connection durability settings. Recorded on every connection and

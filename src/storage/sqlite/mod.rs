@@ -36,6 +36,14 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod admission;
+mod connection;
+mod mutation;
+#[cfg(test)]
+pub(crate) mod faults;
+pub use mutation::{MutationOutcome, PreparedMutation};
+use mutation::Shape;
+
 /// Column separator for the CLI envelope (unit separator; excluded from
 /// validated id alphabets and escaped inside stored JSON).
 const COL_SEP: char = '\x1f';
@@ -191,6 +199,8 @@ pub struct CloseReport {
 #[derive(Debug)]
 struct Inner {
     db_path: PathBuf,
+    file_stamp: admission::FileStamp,
+    identity: String,
     settings: ConnectionSettings,
     bounds: StoreBounds,
     sqlite_version: String,
@@ -223,92 +233,7 @@ impl SqliteStore {
         settings: ConnectionSettings,
         bounds: StoreBounds,
     ) -> Result<(SqliteStore, OpenReport), StorageError> {
-        let parent = db_path
-            .parent()
-            .ok_or_else(|| StorageError::UnwritablePath {
-                path: db_path.display().to_string(),
-                reason: "database path has no parent directory".to_string(),
-            })?;
-        if !parent.is_dir() {
-            return Err(StorageError::UnwritablePath {
-                path: db_path.display().to_string(),
-                reason: "parent directory is missing (the store never creates it implicitly)"
-                    .to_string(),
-            });
-        }
-        if db_path.exists() && db_path.is_dir() {
-            return Err(StorageError::UnwritablePath {
-                path: db_path.display().to_string(),
-                reason: "database path exists but is a directory".to_string(),
-            });
-        }
-        // Honest writability probe: create + remove one probe file. A
-        // read-only directory refuses here with a typed error.
-        let probe = parent.join(format!(".verdant-write-probe-{}", std::process::id()));
-        match std::fs::write(&probe, b"probe") {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&probe);
-            }
-            Err(e) => {
-                if parent_permissions_readonly(parent) {
-                    return Err(StorageError::ReadOnlyPath {
-                        path: parent.display().to_string(),
-                    });
-                }
-                return Err(StorageError::UnwritablePath {
-                    path: db_path.display().to_string(),
-                    reason: e.to_string(),
-                });
-            }
-        }
-
-        let sqlite_version = sqlite_version()?;
-        let preexisting = db_path.exists();
-        let found_generation = read_user_version(db_path)?;
-        let fresh = found_generation == 0;
-        if found_generation != 0 && found_generation != SCHEMA_GENERATION {
-            return Err(StorageError::SchemaMismatch {
-                expected: SCHEMA_GENERATION,
-                found: found_generation.to_string(),
-            });
-        }
-        // Fresh install: apply the reserved migration, stamp the generation,
-        // record the change note. Existing 0001 databases re-apply the same
-        // idempotent file (IF NOT EXISTS) and re-verify objects.
-        apply_migration(db_path)?;
-        write_user_version(db_path, SCHEMA_GENERATION)?;
-        record_migration_note(db_path)?;
-        verify_schema_objects(db_path)?;
-        // No persistent durability setup lives outside the envelope:
-        // journal_size_limit included — every connection sets and re-reads
-        // the full settings block in-band (see envelope_script).
-
-        let store = SqliteStore {
-            inner: Arc::new(Inner {
-                db_path: db_path.to_path_buf(),
-                settings,
-                bounds,
-                sqlite_version: sqlite_version.clone(),
-                handles: AtomicU32::new(1),
-                last_checkpoint_epoch_secs: AtomicU64::new(0),
-            }),
-        };
-        // Full per-connection verification before acknowledging the open.
-        store.exec_verified("SELECT 1;", false)?;
-        let report = store.report()?;
-        let (file_mode, file_uid) = db_file_identity(db_path);
-        Ok((
-            store,
-            OpenReport {
-                fresh: fresh || !preexisting,
-                store: StoreReport {
-                    sqlite_version,
-                    ..report
-                },
-                file_mode,
-                file_uid,
-            },
-        ))
+        admission::open(db_path, settings, bounds)
     }
 
     /// Clone within the in-process handle budget (`max_connections`).
@@ -381,6 +306,19 @@ impl SqliteStore {
         times: TimeTriple,
         record: &RecordIdentity,
     ) -> Result<i64, StorageError> {
+        let pending = self.prepare_insert(operation, entity, sensor, value, unit, times, record)?;
+        let rows = self.submit(&pending).into_result()?;
+        let row = rows.first().ok_or_else(|| connection::failure("insert id missing"))?;
+        admission::scalar(vec![row.clone()])?.parse().map_err(|_| connection::failure("insert id unreadable"))
+    }
+
+    /// Prepare without dispatching. Retain this ticket and use submit/reconcile
+    /// after any unknown outcome; a new ticket is explicitly new additive work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_insert(
+        &self, operation: &OperationId, entity: &InstalledId, sensor: &InstalledId,
+        value: &Value, unit: &Unit, times: TimeTriple, record: &RecordIdentity,
+    ) -> Result<PreparedMutation, StorageError> {
         let value_json = value.to_json();
         if value_json.len() > self.inner.bounds.max_value_bytes {
             return Err(StorageError::ValueTooLarge {
@@ -403,14 +341,13 @@ impl SqliteStore {
             });
         }
         validate_unit(unit)?;
-        self.check_generation()?;
         // One envelope, one transaction: BEGIN IMMEDIATE ... COMMIT with
         // `.bail on` (see run_script_stdin) so a failing second statement or
         // a SIGKILL before COMMIT rolls the whole insert back instead of
         // leaving a committed outbox row with no dirty mark. The
         // last_insert_rowid read sits inside the same transaction.
         let body = format!(
-            "BEGIN IMMEDIATE; INSERT INTO outbox(operation, entity, sensor, value_json, unit, source_ms, receipt_ms, ingestion_ms, generation, seq, status, claimed_by, created_nanos) VALUES ({op}, {entity}, {sensor}, {value}, {unit}, {source}, {receipt}, {ingestion}, {generation}, {seq}, 'queued', NULL, {now}); SELECT last_insert_rowid(); INSERT INTO derived_marks(entity, dirty, checked_generation) VALUES ({entity}, 1, 0) ON CONFLICT(entity) DO UPDATE SET dirty = 1; SELECT changes(); COMMIT;",
+            "INSERT INTO outbox(operation, entity, sensor, value_json, unit, source_ms, receipt_ms, ingestion_ms, generation, seq, status, claimed_by, created_nanos) VALUES ({op}, {entity}, {sensor}, {value}, {unit}, {source}, {receipt}, {ingestion}, {generation}, {seq}, 'queued', NULL, {now}); SELECT last_insert_rowid(); INSERT INTO derived_marks(entity, dirty, checked_generation) VALUES ({entity}, 1, 0) ON CONFLICT(entity) DO UPDATE SET dirty = 1; SELECT changes();",
             op = sql_quote(operation.as_str()),
             entity = sql_quote(entity.as_str()),
             sensor = sql_quote(sensor.as_str()),
@@ -421,21 +358,11 @@ impl SqliteStore {
             ingestion = sql_quote(&times.ingestion().as_millis().to_string()),
             generation = sql_quote(record.generation().as_str()),
             seq = sql_quote(&record.seq().to_string()),
-            now = sql_quote(&epoch_nanos_now()),
+            now = "CAST(unixepoch('subsec') * 1000000000 AS TEXT)",
         );
-        let out = self.exec_verified(&body, true)?;
-        match out.body_rows.first() {
-            Some(cols) if !cols.is_empty() => {
-                cols[0]
-                    .parse::<i64>()
-                    .map_err(|_| StorageError::SqliteFailure {
-                        detail: format!("last_insert_rowid unreadable: '{}'", cols.join(",")),
-                    })
-            }
-            _ => Err(StorageError::SqliteFailure {
-                detail: "insert returned no row id".to_string(),
-            }),
-        }
+        let mut pending = PreparedMutation::new(self, &body, Shape::Insert)?;
+        pending.payload_bytes = value_json.len();
+        Ok(pending)
     }
 
     /// Claim up to `limit` queued rows for `claimed_by`, oldest first.
@@ -447,6 +374,14 @@ impl SqliteStore {
         limit: u32,
         claimed_by: &str,
     ) -> Result<Vec<OutboxRow>, StorageError> {
+        let pending = self.prepare_claim(limit, claimed_by)?;
+        let rows = self.submit(&pending).into_result()?;
+        rows.iter().map(|cols| decode_row(cols)).collect()
+    }
+
+    /// Prepare a bounded claim attempt; retries return the original claim
+    /// snapshot, even after later acknowledgments change the live outbox.
+    pub fn prepare_claim(&self, limit: u32, claimed_by: &str) -> Result<PreparedMutation, StorageError> {
         if limit == 0 {
             return Err(StorageError::InvalidInput {
                 what: "claim limit",
@@ -455,13 +390,11 @@ impl SqliteStore {
         }
         let token = validate_token(claimed_by)?;
         let effective = limit.min(self.inner.bounds.max_replay_rows).max(1);
-        self.check_generation()?;
         let body = format!(
             "UPDATE outbox SET status = 'claimed', claimed_by = {token} WHERE id IN (SELECT id FROM outbox WHERE status = 'queued' ORDER BY id LIMIT {effective}) RETURNING id, quote(operation), quote(entity), quote(sensor), quote(value_json), quote(unit), quote(source_ms), quote(receipt_ms), quote(ingestion_ms), quote(generation), quote(seq), quote(status), quote(claimed_by);",
             token = sql_quote(&token),
         );
-        let out = self.exec_verified(&body, true)?;
-        out.body_rows.iter().map(|cols| decode_row(cols)).collect()
+        PreparedMutation::new(self, &body, Shape::Rows)
     }
 
     /// Acknowledge a claimed row. The token must match the claim owner and the
@@ -469,7 +402,6 @@ impl SqliteStore {
     /// never success (double acknowledge, foreign token, or unknown id).
     pub fn acknowledge(&self, id: i64, expected_token: &str) -> Result<(), StorageError> {
         let token = validate_token(expected_token)?;
-        self.check_generation()?;
         let body = format!(
             "UPDATE outbox SET status = 'acked' WHERE id = {id} AND status = 'claimed' AND claimed_by = {token}; SELECT changes();",
             token = sql_quote(&token),
@@ -491,7 +423,6 @@ impl SqliteStore {
     /// it silently. Zero affected rows is a conflict.
     pub fn requeue_claim(&self, id: i64, expected_token: &str) -> Result<(), StorageError> {
         let token = validate_token(expected_token)?;
-        self.check_generation()?;
         let body = format!(
             "UPDATE outbox SET status = 'queued', claimed_by = NULL WHERE id = {id} AND status = 'claimed' AND claimed_by = {token}; SELECT changes();",
             token = sql_quote(&token),
@@ -616,7 +547,6 @@ impl SqliteStore {
                 ),
             });
         }
-        self.check_generation()?;
         let body = format!(
             "UPDATE derived_marks SET dirty = 0, checked_generation = {generation} WHERE entity = {entity}; SELECT changes();",
             entity = sql_quote(entity.as_str()),
@@ -735,15 +665,15 @@ impl SqliteStore {
     /// Operator / fault-injection seam: the first failing statement aborts the
     /// script, the connection closes without `COMMIT`, and SQLite rolls the
     /// batch back. A nonzero exit is [`StorageError::SqliteFailure`] and the
-    /// caller must assume nothing in the batch committed.
-    pub fn run_transaction(&self, statements: &[&str]) -> Result<(), StorageError> {
+    /// test harness inspects durable rows; this is not a product mutation API.
+    #[cfg(test)]
+    pub(crate) fn run_transaction(&self, statements: &[&str]) -> Result<(), StorageError> {
         if statements.is_empty() {
             return Err(StorageError::InvalidInput {
                 what: "transaction",
                 detail: "transaction requires at least one statement".to_string(),
             });
         }
-        self.check_generation()?;
         let mut body = String::from("BEGIN; ");
         for statement in statements {
             body.push_str(statement);
@@ -753,7 +683,7 @@ impl SqliteStore {
             body.push(' ');
         }
         body.push_str("COMMIT;");
-        let out = self.exec_verified(&body, true)?;
+        let out = run_envelope(self.db_path(), self.settings(), &body)?;
         let _ = out;
         Ok(())
     }
@@ -761,14 +691,19 @@ impl SqliteStore {
     /// Run an arbitrary script body inside the verified envelope with
     /// `.bail on` (fault-injection seam: explicit `ROLLBACK`, corruption
     /// probes, generation tampering in tests). Returns raw body rows.
-    pub fn exec_script(&self, script: &str) -> Result<Vec<Vec<String>>, StorageError> {
+    pub(crate) fn exec_script(&self, script: &str) -> Result<Vec<Vec<String>>, StorageError> {
         if script.trim().is_empty() {
             return Err(StorageError::InvalidInput {
                 what: "script",
                 detail: "script must not be empty".to_string(),
             });
         }
-        Ok(self.exec_verified(script, true)?.body_rows)
+        // Test-only corruption/rollback seam. Product callers are privileged
+        // crate internals and SQLite query_only prevents arbitrary mutation.
+        #[cfg(test)]
+        { Ok(run_envelope(self.db_path(), self.settings(), script)?.body_rows) }
+        #[cfg(not(test))]
+        { Ok(self.exec_verified(script, false)?.body_rows) }
     }
 
     /// Checkpoint, then report final sizes. The handle budget slot is released
@@ -801,19 +736,8 @@ impl SqliteStore {
         None
     }
 
-    fn check_generation(&self) -> Result<(), StorageError> {
-        let found = read_user_version(&self.inner.db_path)?;
-        if found != SCHEMA_GENERATION {
-            return Err(StorageError::SchemaMismatch {
-                expected: SCHEMA_GENERATION,
-                found: found.to_string(),
-            });
-        }
-        Ok(())
-    }
-
     fn exec_changes(&self, body: &str) -> Result<i64, StorageError> {
-        let out = self.exec_verified(body, true)?;
+        let out = self.exec_mutation(body, Shape::Change)?;
         out.body_rows
             .first()
             .and_then(|cols| cols.first())
@@ -823,39 +747,19 @@ impl SqliteStore {
             })
     }
 
-    /// Run one verified envelope connection, with bounded `SQLITE_BUSY`
-    /// retries. `mutating` selects the refusal wording only; verification is
-    /// identical either way.
-    fn exec_verified(&self, body: &str, mutating: bool) -> Result<VerifiedOutput, StorageError> {
-        let mut attempt = 0;
-        loop {
-            match run_envelope(&self.inner.db_path, &self.inner.settings, body) {
-                Ok(out) => return Ok(out),
-                Err(StorageError::SqliteFailure { detail }) if is_busy_text(&detail) => {
-                    attempt += 1;
-                    if attempt > BUSY_RETRIES {
-                        return Err(StorageError::Busy { detail });
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(BUSY_RETRY_PAUSE_MS));
-                }
-                Err(StorageError::SqliteFailure { detail }) => {
-                    if is_readonly_text(&detail) {
-                        return Err(StorageError::ReadOnlyPath {
-                            path: self.inner.db_path.display().to_string(),
-                        });
-                    }
-                    if is_unopenable_text(&detail) {
-                        return Err(StorageError::UnwritablePath {
-                            path: self.inner.db_path.display().to_string(),
-                            reason: detail,
-                        });
-                    }
-                    let _ = mutating;
-                    return Err(StorageError::SqliteFailure { detail });
-                }
-                Err(other) => return Err(other),
-            }
+    /// Product reads share the same admission boundary, but cannot write.
+    fn exec_verified(&self, body: &str, _mutating: bool) -> Result<VerifiedOutput, StorageError> {
+        let mut conn = self.admitted(false)?;
+        if body == "PRAGMA wal_checkpoint(TRUNCATE);" {
+            conn.exchange("ROLLBACK;")?; // SQLite forbids checkpoints in a transaction.
+        } else {
+            conn.exchange("PRAGMA query_only=ON;")?;
         }
+        let body_rows = conn.exchange(body)?;
+        Ok(VerifiedOutput { verified: VerifiedSettings {
+            generation: SCHEMA_GENERATION,
+            journal_size_limit_bytes: self.inner.settings.journal_size_limit_bytes,
+        }, body_rows })
     }
 }
 
@@ -900,9 +804,13 @@ fn run_script_stdin(
     extra_args: &[&str],
     script: &str,
 ) -> Result<Output, StorageError> {
+    // The reference schema is in-memory; filesystem opens share leaf refusal.
+    let io_path = if db_path == Path::new(":memory:") { db_path.to_path_buf() }
+        else { connection::canonical_parent_path(db_path)? };
     let mut child = Command::new("sqlite3")
+        .args(["-batch", "-noinit", "-nofollow"])
         .args(extra_args)
-        .arg(db_path)
+        .arg(&io_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -931,10 +839,13 @@ fn run_script_stdin(
         // Close stdin so the child observes EOF (flush happens on drop);
         // scripts are kilobytes, far below pipe-buffer deadlock territory.
     }
-    child.wait_with_output().map_err(|e| StorageError::Io {
+    let mut output = child.wait_with_output().map_err(|e| StorageError::Io {
         path: db_path.display().to_string(),
         message: format!("failed to collect sqlite3 output: {e}"),
-    })
+    })?;
+    output.stderr = String::from_utf8_lossy(&output.stderr)
+        .replace(io_path.to_string_lossy().as_ref(), db_path.to_string_lossy().as_ref()).into_bytes();
+    Ok(output)
 }
 
 fn run_envelope(
@@ -1235,115 +1146,6 @@ fn sqlite_version() -> Result<String, StorageError> {
         });
     }
     Ok(text)
-}
-
-fn raw_pragma(db_path: &Path, pragma: &str) -> Result<String, StorageError> {
-    // Same bounded busy-retry as the envelope: concurrent writers serialize
-    // in SQLite, and a lone version read must wait its turn, not fail.
-    let mut attempt = 0;
-    loop {
-        let output = Command::new("sqlite3")
-            .arg(db_path)
-            .arg(pragma)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| StorageError::Io {
-                path: db_path.display().to_string(),
-                message: format!("failed to spawn sqlite3: {e}"),
-            })?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
-        }
-        let detail = truncate_text(String::from_utf8_lossy(&output.stderr).trim(), 300);
-        if is_busy_text(&detail) && attempt < BUSY_RETRIES {
-            attempt += 1;
-            std::thread::sleep(std::time::Duration::from_millis(BUSY_RETRY_PAUSE_MS));
-            continue;
-        }
-        if is_busy_text(&detail) {
-            return Err(StorageError::Busy { detail });
-        }
-        return Err(StorageError::SqliteFailure { detail });
-    }
-}
-
-fn read_user_version(db_path: &Path) -> Result<u32, StorageError> {
-    // A missing database reports generation 0 (fresh install path). An
-    // unreadable EXISTING file is a failure, not a fresh install.
-    if !db_path.exists() {
-        return Ok(0);
-    }
-    let raw = raw_pragma(db_path, "PRAGMA user_version;")?;
-    raw.parse::<u32>().map_err(|_| StorageError::SqliteFailure {
-        detail: format!("user_version unreadable: '{raw}'"),
-    })
-}
-
-fn write_user_version(db_path: &Path, generation: u32) -> Result<(), StorageError> {
-    let raw = Command::new("sqlite3")
-        .arg(db_path)
-        .arg(format!("PRAGMA user_version = {generation};"))
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| StorageError::Io {
-            path: db_path.display().to_string(),
-            message: format!("failed to spawn sqlite3: {e}"),
-        })?;
-    if !raw.status.success() {
-        return Err(StorageError::SqliteFailure {
-            detail: "PRAGMA user_version write failed".to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn apply_migration(db_path: &Path) -> Result<(), StorageError> {
-    // Fed on stdin (see run_script_stdin): the migration header starts with
-    // `--` (SQL comments), which argv mode would misread as CLI options.
-    let output = run_script_stdin(db_path, &[], super::MIGRATION_0001_SQL)?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(StorageError::SqliteFailure {
-            detail: format!(
-                "migration 0001_init failed: {}",
-                truncate_text(&detail, 300)
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn record_migration_note(db_path: &Path) -> Result<(), StorageError> {
-    let script = "INSERT INTO schema_migrations(generation, applied_note) VALUES (1, 'M01-PR03 0001_init: initial tiny outbox') ON CONFLICT(generation) DO NOTHING;";
-    let output = Command::new("sqlite3")
-        .arg(db_path)
-        .arg(script)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| StorageError::Io {
-            path: db_path.display().to_string(),
-            message: format!("failed to spawn sqlite3: {e}"),
-        })?;
-    if !output.status.success() {
-        return Err(StorageError::SqliteFailure {
-            detail: "schema_migrations record failed".to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn verify_schema_objects(db_path: &Path) -> Result<(), StorageError> {
-    let raw = raw_pragma(
-        db_path,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','index') AND name IN ('schema_migrations','outbox','derived_marks','idx_outbox_status');",
-    )?;
-    if raw.trim() == "4" {
-        Ok(())
-    } else {
-        Err(StorageError::SqliteFailure {
-            detail: format!("migration 0001_init objects incomplete (matched {raw} of 4)"),
-        })
-    }
 }
 
 fn wal_path(db_path: &Path) -> PathBuf {

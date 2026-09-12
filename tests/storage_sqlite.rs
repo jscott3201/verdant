@@ -127,7 +127,7 @@ fn sqlite_raw(db: &Path, script: &str) -> (bool, String, String) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn migration_reservation_0001_is_exclusive_and_matches_source() {
+fn migration_reservation_0001_0002_chain_matches_source() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
     let mut numbered: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("migrations/sqlite exists") {
@@ -138,12 +138,10 @@ fn migration_reservation_0001_is_exclusive_and_matches_source() {
         }
     }
     numbered.sort();
-    // Reservation: exactly one numbered migration, prefix 0001, no others.
-    assert_eq!(
-        numbered,
-        vec!["0001_init.sql".to_string()],
-        "only 0001 exists"
-    );
+    assert_eq!(numbered, vec!["0001_init.sql", "0002_receipts.sql"]);
+    assert_eq!(storage::MIGRATION_0002.predecessors, &["0001_init"]);
+    assert_eq!(storage::MIGRATION_0002.id, "0002_receipts");
+    assert_eq!(std::fs::read_to_string(dir.join("0002_receipts.sql")).expect("read 0002"), storage::MIGRATION_0002_SQL);
     assert_eq!(storage::MIGRATION_ID, "0001_init");
     let on_disk = std::fs::read_to_string(dir.join("0001_init.sql")).expect("read 0001_init.sql");
     assert_eq!(
