@@ -46,6 +46,16 @@ cargo test --locked
   `src/` via the integration owner.
 - Storage and schema changes are reserved through the integration owner;
   applied migrations are never rewritten.
+- Rust file line cap (local pre-commit hook, grandfather + enforce-forward):
+  `.rs` files are capped at 700 total lines
+  (staged `git show :path | wc -l`). New or previously compliant files over
+  700 fail; grandfathered files fail only on growth (staged > HEAD).
+  Grandfathered as of this change (record, do not split here):
+  `src/access/mod.rs` (2053), `src/storage/sqlite/mod.rs` (1548),
+  `tests/storage_sqlite.rs` (1199), `tests/access_boundaries.rs` (904),
+  `src/semantics/convert.rs` (949), `tests/semantics_profile.rs` (778).
+  Fresh clones: `git config core.hooksPath .githooks`. Product CI does not
+  run git hooks (server-side unaffected — hooks are local).
 
 ## Scope boundaries
 
