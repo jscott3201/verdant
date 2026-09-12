@@ -276,7 +276,12 @@ fn r04_lock_wait_retries_share_deadline_and_permit() {
     let after = store.execution_report();
     assert!((1..=3).contains(&(after.spawned - before.spawned)), "{before:?} {after:?}");
     assert_eq!(after.running, 1, "only the original lock remains admitted");
-    tune(&mut store).settings.operation_timeout_ms = 1000;
+    // BUSY_RETRIES=5 and BUSY_RETRY_PAUSE_MS=25 (mod.rs): six 5ms waits
+    // + five 25ms pauses = 155ms nominal retry horizon, excluding CLI overhead.
+    // Keep the deadline orders of magnitude larger so retry exhaustion, not
+    // scheduler stalls, decides "busy"; a >30s stall is a CI-health failure.
+    // Retries still consume one shared, bounded deadline/permit budget.
+    tune(&mut store).settings.operation_timeout_ms = 30_000;
     assert_eq!(store.admitted(true).err().expect("bounded lock retries").code(), "busy");
     lock.exchange("ROLLBACK;").expect("release writer");
     drop(lock);
