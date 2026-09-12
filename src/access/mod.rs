@@ -27,11 +27,11 @@
 //! revocation records live in the PR03 0001 `outbox` table as additive rows
 //! with reserved operations (`access-bootstrap`, `access-issue`,
 //! `access-revoke`), a fixed unit (`access-event`), the shared synthetic
-//! sensor (`sensor-sat-1`), and a `Value::Text` descriptor (`v=1;kind=...`
+//! sensor (`sensor-sat-1`), and a `Value::Text` descriptor (`v=2;kind=...`
 //! with percent-encoding for `%;=` and control bytes). This preserves the
 //! PR03 reservation test (exactly one numbered migration), keeps
 //! `SCHEMA_GENERATION == 1` for every statement, and needs no storage
-//! semantics change. A future slice that outgrows the outbox (for example,
+//! schema change. Format decision: v2 only, no v1 read compatibility. A slice that outgrows the outbox (for example,
 //! horizon-bounded replay past `max_replay_rows`) must reserve `0002` through
 //! the integration owner; applied migrations are never rewritten.
 //!
@@ -47,10 +47,10 @@
 //!                         tolerated + counted, never merged (same as PR03)
 //! lock / space needs ..: same envelope as PR03 (WAL + FULL-sync + 5 s busy
 //!                         timeout, bounded retries); temp DBs in OS temp dirs
-//! interruption outcome : uncommitted inserts never survive; partial bootstrap
-//!                         leaves visible rows and requires operator reset
-//!                         (delete the synthetic DB); re-bootstrap never
-//!                         silently overwrites (typed already-bootstrapped)
+//! interruption outcome : bootstrap/rotation commit as guarded batches;
+//!                         known noncommit leaves zero partial rows/receipts.
+//!                         UNKNOWN exposes an operation identity to reconcile;
+//!                         never retry as fresh work or mint fallback keys.
 //! read / write policy .: every admission read/write runs inside the verified
 //!                         PR03 envelope (generation + durability re-read
 //!                         in-band); unknown generation refused, never skipped
@@ -90,7 +90,10 @@
 //! semantics (`REQUIRED_REVIEW_CEILING` / `REQUIRED_PUBLISH_CEILING` against
 //! the issued [`CredentialCeiling`] level), and
 //! [`AccessGate::is_revoked`] as the offline revocation-verification path
-//! (file reads only, no server).
+//! (file reads only, no server). R05 actor construction is access-private;
+//! parsed domain scopes and ceilings are representations, not authentication.
+//! Issuance checks an administrator credential and persisted policy, including
+//! expiry, then revalidates its exact snapshot inside the owning transaction.
 
 use crate::domain::clock::{TimeTriple, UnixMillis};
 use crate::domain::ids::{InstalledId, OperationId, SourceGenerationId};
@@ -103,6 +106,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+pub(crate) mod testing;
 
 /// Access schema generation: bound to the PR03 0001 baseline, always 1 here.
 pub const ACCESS_SCHEMA_GENERATION: u32 = 1;
@@ -428,6 +434,12 @@ pub struct EnterReport {
     pub role: String,
     /// Capability generation at entry.
     pub cap_generation: u32,
+    actor: ActorContext,
+}
+
+impl EnterReport {
+    /// Stable authenticated references for R06; emission remains its owner.
+    pub fn actor(&self) -> &ActorContext { &self.actor }
 }
 
 /// Bootstrap credentials (raw keys are returned once; there is no recovery).
@@ -466,6 +478,17 @@ pub enum AccessError {
         presented: u32,
         current: u32,
     },
+    /// No administrative privilege was issued to this credential.
+    AdministrationDenied,
+    /// Delegated policy exceeds the authenticating administrator's authority.
+    PolicyDenied { detail: String },
+    /// A persisted expiry has been reached (inclusive deadline).
+    ExpiredCredential { expires_at_ms: i64 },
+    /// Capability generations never wrap or panic.
+    GenerationOverflow { capability: String },
+    /// COMMIT was dispatched without a known result; reconcile this operation
+    /// through the store, never retry the access mutation as new work.
+    MutationUnknown { operation: OperationId, detail: String },
     /// Anonymous (missing credential) entry attempt.
     AnonymousDenied { detail: String },
     /// Remote listener bind requested (local-only per D04).
@@ -492,6 +515,11 @@ impl AccessError {
             AccessError::RoleDenied { .. } => "role-denied",
             AccessError::RevokedCredential { .. } => "revoked-credential",
             AccessError::StaleGeneration { .. } => "stale-generation",
+            AccessError::AdministrationDenied => "administration-denied",
+            AccessError::PolicyDenied { .. } => "policy-denied",
+            AccessError::ExpiredCredential { .. } => "expired-credential",
+            AccessError::GenerationOverflow { .. } => "generation-overflow",
+            AccessError::MutationUnknown { .. } => "mutation-unknown",
             AccessError::AnonymousDenied { .. } => "anonymous-denied",
             AccessError::ListenerRefused { .. } => "listener-refused",
             AccessError::InvalidInput { .. } => "invalid-input",
@@ -549,6 +577,11 @@ impl fmt::Display for AccessError {
             AccessError::AnonymousDenied { detail } => {
                 write!(f, "anonymous denied: {detail}")
             }
+            AccessError::AdministrationDenied => write!(f, "credential has no administrative privilege"),
+            AccessError::PolicyDenied { detail } => write!(f, "policy denied: {detail}"),
+            AccessError::ExpiredCredential { expires_at_ms } => write!(f, "credential expired at {expires_at_ms}"),
+            AccessError::GenerationOverflow { capability } => write!(f, "capability '{capability}' generation exhausted"),
+            AccessError::MutationUnknown { operation, detail } => write!(f, "UNKNOWN outcome for {}; reconcile that identity, do not retry as new work: {detail}", operation.as_str()),
             AccessError::ListenerRefused { detail } => {
                 write!(f, "remote listener refused: {detail}")
             }
@@ -721,6 +754,7 @@ struct IssueRow {
     user: String,
     reason: String,
     label: String,
+    policy: CapabilityPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -742,7 +776,7 @@ struct BootstrapRow {
 
 fn encode_issue(row: &IssueRow) -> String {
     format!(
-        "v=1;kind=issue;cap={};scope={};ceiling={};role={};key={};keyfp={};issuer={};capgen={};user={};reason={};label={}",
+        "v=2;kind=issue;cap={};scope={};ceiling={};role={};key={};keyfp={};issuer={};capgen={};user={};reason={};label={};admin={};scopes={};expires={}",
         pct_encode(&row.cap),
         pct_encode(&row.scope),
         row.ceiling,
@@ -754,12 +788,15 @@ fn encode_issue(row: &IssueRow) -> String {
         pct_encode(&row.user),
         pct_encode(&row.reason),
         pct_encode(&row.label),
+        row.policy.admin_ceiling.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
+        pct_encode(&row.policy.scopes.iter().map(TrustedScope::as_str).collect::<Vec<_>>().join(",")),
+        row.policy.expires_at_ms.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
     )
 }
 
 fn encode_revoke(row: &RevokeRow) -> String {
     format!(
-        "v=1;kind=revoke;cap={};key={};capgen={};issuer={};reason={}",
+        "v=2;kind=revoke;cap={};key={};capgen={};issuer={};reason={}",
         pct_encode(&row.cap),
         pct_encode(&row.key_id),
         row.capgen,
@@ -770,7 +807,7 @@ fn encode_revoke(row: &RevokeRow) -> String {
 
 fn encode_bootstrap(row: &BootstrapRow) -> String {
     format!(
-        "v=1;kind=bootstrap;user={};issuer={};reason={};generation={}",
+        "v=2;kind=bootstrap;user={};issuer={};reason={};generation={}",
         pct_encode(&row.user),
         pct_encode(&row.issuer),
         pct_encode(&row.reason),
@@ -825,7 +862,7 @@ fn reject_unknown_fields(
 fn decode_descriptor(raw: &str) -> Result<(String, BTreeMap<String, String>), AccessError> {
     let map = split_descriptor(raw)?;
     let version = require_field(&map, "v")?;
-    if version != "1" {
+    if version != "2" {
         return Err(AccessError::InvalidRecord {
             detail: format!("unsupported admission descriptor version '{version}'"),
         });
@@ -843,7 +880,7 @@ fn decode_descriptor(raw: &str) -> Result<(String, BTreeMap<String, String>), Ac
                 &map,
                 &[
                     "v", "kind", "cap", "scope", "ceiling", "role", "key", "keyfp", "issuer",
-                    "capgen", "user", "reason", "label",
+                    "capgen", "user", "reason", "label", "admin", "scopes", "expires",
                 ],
             )?;
         }
@@ -909,6 +946,22 @@ fn decode_issue(map: &BTreeMap<String, String>) -> Result<IssueRow, AccessError>
     if label.is_empty() {
         return Err(bad("issue label must not be empty".to_string()));
     }
+    let expires = require_field(map, "expires")?;
+    let expires = if expires == "none" { None } else {
+        Some(UnixMillis::new(expires.parse::<i64>().map_err(|_| bad("invalid expiry".into()))?))
+    };
+    let admin = require_field(map, "admin")?;
+    let scopes = require_field(map, "scopes")?;
+    let policy = if admin == "none" {
+        if !scopes.is_empty() { return Err(bad("entry-only policy has administrative scopes".into())); }
+        CapabilityPolicy::entry_only(expires)
+    } else {
+        let admin = admin.parse::<u8>().map_err(|_| bad("invalid administrative ceiling".into()))?;
+        if admin > ceiling { return Err(bad("administrative ceiling exceeds credential ceiling".into())); }
+        let scopes = scopes.split(',').map(TrustedScope::parse).collect::<Result<Vec<_>, _>>()
+            .map_err(|e| bad(e.to_string()))?;
+        CapabilityPolicy::administrator(scopes, admin, expires).map_err(|e| bad(e.to_string()))?
+    };
     Ok(IssueRow {
         cap,
         scope,
@@ -921,6 +974,7 @@ fn decode_issue(map: &BTreeMap<String, String>) -> Result<IssueRow, AccessError>
         user,
         reason,
         label,
+        policy,
     })
 }
 
@@ -979,786 +1033,11 @@ fn decode_bootstrap(map: &BTreeMap<String, String>) -> Result<BootstrapRow, Acce
     })
 }
 
-/// Direct-entry gate: the PR07 binding entry point for capability checks.
-#[derive(Debug)]
-pub struct AccessGate {
-    store: SqliteStore,
-    issuer: IssuerId,
-    user: UserId,
-    next_seq: AtomicU64,
-}
-
-impl AccessGate {
-    /// First-run synthetic bootstrap: mints reviewer + publisher for the
-    /// single synthetic user, recorded with `reason`. Refuses when any
-    /// admission row already exists (typed, never silent overwrite).
-    pub fn bootstrap(
-        db_path: &Path,
-        settings: ConnectionSettings,
-        bounds: StoreBounds,
-        reason: &Reason,
-    ) -> Result<(AccessGate, BootstrapCredentials), AccessError> {
-        assert_schema_generation();
-        let (store, _) =
-            SqliteStore::open(db_path, settings, bounds).map_err(AccessError::Store)?;
-        if access_row_count(&store)? > 0 {
-            return Err(AccessError::AlreadyBootstrapped {
-                detail: "admission records already exist; re-bootstrap is refused".to_string(),
-            });
-        }
-        let issuer = frozen_issuer();
-        let user = frozen_user();
-        let mut seq = access_row_count(&store)?.saturating_add(1).max(1);
-
-        let marker = BootstrapRow {
-            user: user.as_str().to_string(),
-            issuer: issuer.as_str().to_string(),
-            reason: reason.as_str().to_string(),
-            generation: ACCESS_SCHEMA_GENERATION,
-        };
-        insert_admission(
-            &store,
-            OP_BOOTSTRAP_TEXT,
-            &marker_reason_entity(&user),
-            &encode_bootstrap(&marker),
-            seq,
-        )?;
-        seq += 1;
-
-        let uniq = BOOTSTRAP_SEQ.fetch_add(1, Ordering::SeqCst);
-        let pid = std::process::id();
-        let reviewer_key_raw = format!("synthetic-bootstrap-{pid}-{uniq}-reviewer-1");
-        let publisher_key_raw = format!("synthetic-bootstrap-{pid}-{uniq}-publisher-1");
-        let reviewer_key =
-            SyntheticKey::parse(&reviewer_key_raw).map_err(|e| AccessError::InvalidRecord {
-                detail: format!("frozen bootstrap reviewer key invalid: {e}"),
-            })?;
-        let publisher_key =
-            SyntheticKey::parse(&publisher_key_raw).map_err(|e| AccessError::InvalidRecord {
-                detail: format!("frozen bootstrap publisher key invalid: {e}"),
-            })?;
-        let reviewer_cap =
-            CapabilityName::parse(REVIEWER_CAP_TEXT).expect("frozen reviewer name is valid");
-        let publisher_cap =
-            CapabilityName::parse(PUBLISHER_CAP_TEXT).expect("frozen publisher name is valid");
-        let reviewer_key_id =
-            KeyId::parse(REVIEWER_KEY_TEXT).expect("frozen reviewer key id is valid");
-        let publisher_key_id =
-            KeyId::parse(PUBLISHER_KEY_TEXT).expect("frozen publisher key id is valid");
-        let scope_a = TrustedScope::parse("scope-a").expect("frozen bootstrap scope is valid");
-        let label = SYNTHETIC_LABEL_TEXT;
-
-        let reviewer_issue = IssueRow {
-            cap: reviewer_cap.as_str().to_string(),
-            scope: scope_a.as_str().to_string(),
-            ceiling: REQUIRED_REVIEW_CEILING,
-            role: RoleKind::Reviewer.as_str().to_string(),
-            key_id: reviewer_key_id.as_str().to_string(),
-            key_fp: reviewer_key.fingerprint(),
-            issuer: issuer.as_str().to_string(),
-            capgen: 1,
-            user: user.as_str().to_string(),
-            reason: reason.as_str().to_string(),
-            label: label.to_string(),
-        };
-        insert_admission(
-            &store,
-            OP_ISSUE_TEXT,
-            &reviewer_cap,
-            &encode_issue(&reviewer_issue),
-            seq,
-        )?;
-        seq += 1;
-        let publisher_issue = IssueRow {
-            cap: publisher_cap.as_str().to_string(),
-            scope: scope_a.as_str().to_string(),
-            ceiling: REQUIRED_PUBLISH_CEILING,
-            role: RoleKind::Publisher.as_str().to_string(),
-            key_id: publisher_key_id.as_str().to_string(),
-            key_fp: publisher_key.fingerprint(),
-            issuer: issuer.as_str().to_string(),
-            capgen: 1,
-            user: user.as_str().to_string(),
-            reason: reason.as_str().to_string(),
-            label: label.to_string(),
-        };
-        insert_admission(
-            &store,
-            OP_ISSUE_TEXT,
-            &publisher_cap,
-            &encode_issue(&publisher_issue),
-            seq,
-        )?;
-        seq += 1;
-
-        let gate = AccessGate {
-            store,
-            issuer,
-            user,
-            next_seq: AtomicU64::new(seq),
-        };
-        let creds = BootstrapCredentials {
-            reviewer: Credential::new(reviewer_cap, reviewer_key_id, reviewer_key),
-            publisher: Credential::new(publisher_cap, publisher_key_id, publisher_key),
-        };
-        Ok((gate, creds))
-    }
-
-    /// Open an existing database (generation checked; bootstrap presence is
-    /// checked per operation so missing bootstrap fails closed at entry).
-    pub fn open(
-        db_path: &Path,
-        settings: ConnectionSettings,
-        bounds: StoreBounds,
-    ) -> Result<AccessGate, AccessError> {
-        assert_schema_generation();
-        let (store, _) =
-            SqliteStore::open(db_path, settings, bounds).map_err(AccessError::Store)?;
-        let start = outbox_count(&store)?.saturating_add(1).max(1);
-        Ok(AccessGate {
-            store,
-            issuer: frozen_issuer(),
-            user: frozen_user(),
-            next_seq: AtomicU64::new(start),
-        })
-    }
-
-    /// Borrow the underlying PR03 store (for offline verification reads and
-    /// forgery-probe tests that need direct envelope access).
-    pub fn store(&self) -> &SqliteStore {
-        &self.store
-    }
-
-    /// Database path (synthetic temp paths in tests; never a repo path).
-    pub fn db_path(&self) -> &Path {
-        self.store.db_path()
-    }
-
-    /// Trusted bootstrap issuer identity.
-    pub fn issuer(&self) -> &IssuerId {
-        &self.issuer
-    }
-
-    /// Single synthetic user identity.
-    pub fn user(&self) -> &UserId {
-        &self.user
-    }
-
-    /// Scope-limited, ceiling-bound issuance of a new named capability.
-    /// The capability name must be fresh (existing names rotate, never
-    /// overwrite); the issuer must be the trusted bootstrap issuer.
-    #[allow(clippy::too_many_arguments)]
-    pub fn issue(
-        &self,
-        capability: &CapabilityName,
-        scope: &TrustedScope,
-        ceiling: u8,
-        role: RoleKind,
-        key_id: &KeyId,
-        key: &SyntheticKey,
-        issuer: &IssuerId,
-        reason: &Reason,
-        label: &DisplayLabel,
-    ) -> Result<Credential, AccessError> {
-        self.require_bootstrapped()?;
-        if ceiling > MAX_CEILING_LEVEL {
-            return Err(AccessError::InvalidInput {
-                what: "ceiling",
-                detail: format!("ceiling {ceiling} exceeds max {MAX_CEILING_LEVEL}"),
-            });
-        }
-        if issuer != &self.issuer {
-            return Err(AccessError::UnknownIssuer {
-                issuer: issuer.as_str().to_string(),
-            });
-        }
-        // Validate the ceiling through the domain constructor as well so the
-        // bound travels with its scope (no silent re-targeting).
-        let _ = CredentialCeiling::new(scope.clone(), ceiling).map_err(|e| {
-            AccessError::InvalidInput {
-                what: "ceiling",
-                detail: format!("credential ceiling invalid: {e}"),
-            }
-        })?;
-        if self.find_issue(capability.as_str())?.is_some() {
-            return Err(AccessError::AlreadyBootstrapped {
-                detail: format!(
-                    "capability '{}' already issued; use rotation, not re-issuance",
-                    capability.as_str()
-                ),
-            });
-        }
-        let row = IssueRow {
-            cap: capability.as_str().to_string(),
-            scope: scope.as_str().to_string(),
-            ceiling,
-            role: role.as_str().to_string(),
-            key_id: key_id.as_str().to_string(),
-            key_fp: key.fingerprint(),
-            issuer: issuer.as_str().to_string(),
-            capgen: 1,
-            user: self.user.as_str().to_string(),
-            reason: reason.as_str().to_string(),
-            label: label.as_str().to_string(),
-        };
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        insert_admission(
-            &self.store,
-            OP_ISSUE_TEXT,
-            capability,
-            &encode_issue(&row),
-            seq,
-        )?;
-        Ok(Credential::new(
-            capability.clone(),
-            key_id.clone(),
-            key.clone(),
-        ))
-    }
-
-    /// Rotation with reason: revokes the presented key and issues a new key
-    /// for the same capability at the next generation. The old key fails
-    /// closed afterwards (revoked + stale).
-    pub fn rotate(
-        &self,
-        current: &Credential,
-        new_key_id: &KeyId,
-        new_key: &SyntheticKey,
-        reason: &Reason,
-    ) -> Result<Credential, AccessError> {
-        let checked = self.check_credential(current, None)?;
-        // Fail closed like the enter paths: a revoked or stale credential
-        // must not rotate into a valid successor (no gen inflation, no
-        // revocation void, no holder DoS). No writes happen on refusal.
-        self.require_not_revoked(&checked)?;
-        self.require_current_generation(&checked)?;
-        let next_gen = checked.max_gen + 1;
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let revoke = RevokeRow {
-            cap: current.capability.as_str().to_string(),
-            key_id: current.key_id.as_str().to_string(),
-            capgen: checked.matched.capgen,
-            issuer: self.issuer.as_str().to_string(),
-            reason: reason.as_str().to_string(),
-        };
-        insert_admission(
-            &self.store,
-            OP_REVOKE_TEXT,
-            &current.capability,
-            &encode_revoke(&revoke),
-            seq,
-        )?;
-        let seq2 = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let issue = IssueRow {
-            cap: checked.matched.cap.clone(),
-            scope: checked.matched.scope.clone(),
-            ceiling: checked.matched.ceiling,
-            role: checked.matched.role.clone(),
-            key_id: new_key_id.as_str().to_string(),
-            key_fp: new_key.fingerprint(),
-            issuer: self.issuer.as_str().to_string(),
-            capgen: next_gen,
-            user: self.user.as_str().to_string(),
-            reason: reason.as_str().to_string(),
-            label: checked.matched.label.clone(),
-        };
-        // The entity column carries the capability name; the key id travels
-        // inside the descriptor (sensor stays the shared synthetic sensor).
-        let cap_name = CapabilityName::parse(&checked.matched.cap).map_err(|e| {
-            AccessError::InvalidRecord {
-                detail: format!("stored capability name invalid: {e}"),
-            }
-        })?;
-        insert_admission(
-            &self.store,
-            OP_ISSUE_TEXT,
-            &cap_name,
-            &encode_issue(&issue),
-            seq2,
-        )?;
-        Ok(Credential::new(
-            cap_name,
-            new_key_id.clone(),
-            new_key.clone(),
-        ))
-    }
-
-    /// Explicit revocation with reason (offline-notary statement). Afterwards
-    /// the credential fails closed on all enter paths.
-    pub fn revoke(&self, current: &Credential, reason: &Reason) -> Result<(), AccessError> {
-        let checked = self.check_credential(current, None)?;
-        if self.is_revoked(&checked.matched_cap()?, &checked.matched_key()?)? {
-            return Err(AccessError::RevokedCredential {
-                capability: current.capability.as_str().to_string(),
-                key: current.key_id.as_str().to_string(),
-            });
-        }
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let revoke = RevokeRow {
-            cap: current.capability.as_str().to_string(),
-            key_id: current.key_id.as_str().to_string(),
-            capgen: checked.matched.capgen,
-            issuer: self.issuer.as_str().to_string(),
-            reason: reason.as_str().to_string(),
-        };
-        insert_admission(
-            &self.store,
-            OP_REVOKE_TEXT,
-            &current.capability,
-            &encode_revoke(&revoke),
-            seq,
-        )?;
-        Ok(())
-    }
-
-    /// Review entry: named ceiling/key + scope + role + revocation, all
-    /// fail-closed. `None` credential is an explicit anonymous refusal.
-    pub fn enter_review(
-        &self,
-        credential: Option<&Credential>,
-        scope: &TrustedScope,
-    ) -> Result<EnterReport, AccessError> {
-        let cred = Self::require_credential(credential)?;
-        let checked = self.check_credential(cred, Some(scope))?;
-        // Revocation and staleness fail closed before ceiling/role so a
-        // revoked key reports revoked on every path.
-        self.require_not_revoked(&checked)?;
-        self.require_current_generation(&checked)?;
-        if checked.matched.ceiling < REQUIRED_REVIEW_CEILING {
-            return Err(AccessError::CeilingExceeded {
-                have: checked.matched.ceiling,
-                required: REQUIRED_REVIEW_CEILING,
-            });
-        }
-        match checked.role_kind()? {
-            RoleKind::Reviewer | RoleKind::Publisher => {}
-        }
-        Ok(checked.enter_report())
-    }
-
-    /// Publish entry: reviewer credentials cannot publish (role + ceiling).
-    /// `None` credential is an explicit anonymous refusal.
-    pub fn enter_publish(
-        &self,
-        credential: Option<&Credential>,
-        scope: &TrustedScope,
-    ) -> Result<EnterReport, AccessError> {
-        let cred = Self::require_credential(credential)?;
-        let checked = self.check_credential(cred, Some(scope))?;
-        // Revocation and staleness fail closed before ceiling/role so a
-        // revoked key reports revoked on every path.
-        self.require_not_revoked(&checked)?;
-        self.require_current_generation(&checked)?;
-        if checked.matched.ceiling < REQUIRED_PUBLISH_CEILING {
-            return Err(AccessError::CeilingExceeded {
-                have: checked.matched.ceiling,
-                required: REQUIRED_PUBLISH_CEILING,
-            });
-        }
-        match checked.role_kind()? {
-            RoleKind::Publisher => {}
-            RoleKind::Reviewer => {
-                return Err(AccessError::RoleDenied {
-                    have: RoleKind::Reviewer.as_str().to_string(),
-                    required: RoleKind::Publisher.as_str().to_string(),
-                })
-            }
-        }
-        Ok(checked.enter_report())
-    }
-
-    /// Offline revocation verification (file reads only, no live server).
-    /// This is the PR07 revocation-verification path.
-    pub fn is_revoked(
-        &self,
-        capability: &CapabilityName,
-        key_id: &KeyId,
-    ) -> Result<bool, AccessError> {
-        let revokes = self.read_revokes()?;
-        Ok(revokes
-            .iter()
-            .any(|r| r.cap == capability.as_str() && r.key_id == key_id.as_str()))
-    }
-
-    /// Recorded bootstrap reason (admission evidence).
-    pub fn bootstrap_reason(&self) -> Result<String, AccessError> {
-        let rows = self.read_bootstraps()?;
-        rows.first()
-            .map(|r| r.reason.clone())
-            .ok_or_else(|| AccessError::NotBootstrapped {
-                detail: "no bootstrap admission record".to_string(),
-            })
-    }
-
-    /// Recorded display label for a capability (labels are not identity).
-    pub fn label_of(&self, capability: &CapabilityName) -> Result<String, AccessError> {
-        let issues = self.read_issues()?;
-        issues
-            .iter()
-            .filter(|r| r.cap == capability.as_str())
-            .max_by_key(|r| r.capgen)
-            .map(|r| r.label.clone())
-            .ok_or_else(|| AccessError::UnknownCapability {
-                capability: capability.as_str().to_string(),
-            })
-    }
-
-    /// Recorded issuance reason for a capability (latest generation).
-    pub fn issue_reason(&self, capability: &CapabilityName) -> Result<String, AccessError> {
-        let issues = self.read_issues()?;
-        issues
-            .iter()
-            .filter(|r| r.cap == capability.as_str())
-            .max_by_key(|r| r.capgen)
-            .map(|r| r.reason.clone())
-            .ok_or_else(|| AccessError::UnknownCapability {
-                capability: capability.as_str().to_string(),
-            })
-    }
-
-    /// Recorded revocation reason for a key, if revoked.
-    pub fn revocation_reason(
-        &self,
-        capability: &CapabilityName,
-        key_id: &KeyId,
-    ) -> Result<Option<String>, AccessError> {
-        let revokes = self.read_revokes()?;
-        Ok(revokes
-            .iter()
-            .find(|r| r.cap == capability.as_str() && r.key_id == key_id.as_str())
-            .map(|r| r.reason.clone()))
-    }
-
-    /// Number of admission rows (bootstrap + issues + revokes, all statuses).
-    pub fn admission_count(&self) -> Result<u64, AccessError> {
-        access_row_count(&self.store)
-    }
-
-    fn require_credential(credential: Option<&Credential>) -> Result<&Credential, AccessError> {
-        match credential {
-            Some(cred) => Ok(cred),
-            None => {
-                eprintln!(
-                    "verdant access refuses anonymous entry [anonymous-denied] (named ceiling/key required; local-only)"
-                );
-                Err(AccessError::AnonymousDenied {
-                    detail: "anonymous entry is refused; present a named capability credential"
-                        .to_string(),
-                })
-            }
-        }
-    }
-
-    fn require_bootstrapped(&self) -> Result<(), AccessError> {
-        if access_row_count(&self.store)? == 0 {
-            return Err(AccessError::NotBootstrapped {
-                detail: "no admission records; bootstrap first".to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    fn find_issue(&self, cap: &str) -> Result<Option<IssueRow>, AccessError> {
-        let issues = self.read_issues()?;
-        Ok(issues.into_iter().find(|r| r.cap == cap))
-    }
-
-    fn check_credential(
-        &self,
-        cred: &Credential,
-        scope: Option<&TrustedScope>,
-    ) -> Result<CheckedCredential, AccessError> {
-        self.require_bootstrapped()?;
-        let issues = self.read_issues()?;
-        let mut for_cap: Vec<IssueRow> = issues
-            .into_iter()
-            .filter(|r| r.cap == cred.capability.as_str())
-            .collect();
-        if for_cap.is_empty() {
-            return Err(AccessError::UnknownCapability {
-                capability: cred.capability.as_str().to_string(),
-            });
-        }
-        for_cap.sort_by_key(|r| r.capgen);
-        let max_gen = for_cap.iter().map(|r| r.capgen).max().unwrap_or(1);
-        let matched = for_cap
-            .iter()
-            .find(|r| r.key_id == cred.key_id.as_str())
-            .cloned()
-            .ok_or_else(|| AccessError::ForgedCredential {
-                detail: format!(
-                    "key '{}' was never issued for capability '{}'",
-                    cred.key_id.as_str(),
-                    cred.capability.as_str()
-                ),
-            })?;
-        if matched.issuer != self.issuer.as_str() {
-            return Err(AccessError::UnknownIssuer {
-                issuer: matched.issuer.clone(),
-            });
-        }
-        if matched.key_fp != cred.key.fingerprint() {
-            return Err(AccessError::ForgedCredential {
-                detail: format!(
-                    "key material does not match the issued fingerprint for capability '{}'",
-                    cred.capability.as_str()
-                ),
-            });
-        }
-        if let Some(want) = scope {
-            if matched.scope != want.as_str() {
-                return Err(AccessError::ScopeDenied {
-                    expected: matched.scope.clone(),
-                    presented: want.as_str().to_string(),
-                });
-            }
-        }
-        Ok(CheckedCredential { matched, max_gen })
-    }
-
-    fn require_not_revoked(&self, checked: &CheckedCredential) -> Result<(), AccessError> {
-        let revokes = self.read_revokes()?;
-        let hit = revokes
-            .iter()
-            .any(|r| r.cap == checked.matched.cap && r.key_id == checked.matched.key_id);
-        if hit {
-            return Err(AccessError::RevokedCredential {
-                capability: checked.matched.cap.clone(),
-                key: checked.matched.key_id.clone(),
-            });
-        }
-        Ok(())
-    }
-
-    fn require_current_generation(&self, checked: &CheckedCredential) -> Result<(), AccessError> {
-        if checked.matched.capgen != checked.max_gen {
-            return Err(AccessError::StaleGeneration {
-                capability: checked.matched.cap.clone(),
-                presented: checked.matched.capgen,
-                current: checked.max_gen,
-            });
-        }
-        Ok(())
-    }
-
-    fn read_issues(&self) -> Result<Vec<IssueRow>, AccessError> {
-        let mut out = Vec::new();
-        for (_, descriptor) in self.read_descriptors()? {
-            let (kind, map) = decode_descriptor(&descriptor)?;
-            match kind.as_str() {
-                "issue" => out.push(decode_issue(&map)?),
-                "bootstrap" | "revoke" => {}
-                _ => {
-                    return Err(AccessError::InvalidRecord {
-                        detail: format!("unknown admission kind '{kind}'"),
-                    })
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn read_revokes(&self) -> Result<Vec<RevokeRow>, AccessError> {
-        let mut out = Vec::new();
-        for (_, descriptor) in self.read_descriptors()? {
-            let (kind, map) = decode_descriptor(&descriptor)?;
-            match kind.as_str() {
-                "revoke" => out.push(decode_revoke(&map)?),
-                "bootstrap" | "issue" => {}
-                _ => {
-                    return Err(AccessError::InvalidRecord {
-                        detail: format!("unknown admission kind '{kind}'"),
-                    })
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn read_bootstraps(&self) -> Result<Vec<BootstrapRow>, AccessError> {
-        let mut out = Vec::new();
-        for (_, descriptor) in self.read_descriptors()? {
-            let (kind, map) = decode_descriptor(&descriptor)?;
-            match kind.as_str() {
-                "bootstrap" => out.push(decode_bootstrap(&map)?),
-                "issue" | "revoke" => {}
-                _ => {
-                    return Err(AccessError::InvalidRecord {
-                        detail: format!("unknown admission kind '{kind}'"),
-                    })
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Read all admission descriptors (all outbox statuses, fail closed on
-    /// corrupt rows). Returns `(operation, descriptor)` pairs.
-    fn read_descriptors(&self) -> Result<Vec<(String, String)>, AccessError> {
-        let script = format!(
-            "SELECT quote(operation), quote(entity), quote(value_json) FROM outbox WHERE operation LIKE {} ORDER BY id;",
-            sql_quote("access-%")
-        );
-        let rows = self
-            .store
-            .exec_script(&script)
-            .map_err(AccessError::Store)?;
-        let mut out = Vec::new();
-        for cols in &rows {
-            if cols.len() != 3 {
-                return Err(AccessError::InvalidRecord {
-                    detail: format!("admission scan row has {} columns, expected 3", cols.len()),
-                });
-            }
-            let operation =
-                unquote_column(&cols[0])?.ok_or_else(|| AccessError::InvalidRecord {
-                    detail: "admission operation is NULL".to_string(),
-                })?;
-            match operation.as_str() {
-                OP_BOOTSTRAP_TEXT | OP_ISSUE_TEXT | OP_REVOKE_TEXT => {}
-                _ => {
-                    return Err(AccessError::InvalidRecord {
-                        detail: format!("unexpected admission operation '{operation}'"),
-                    })
-                }
-            }
-            let value_json =
-                unquote_column(&cols[2])?.ok_or_else(|| AccessError::InvalidRecord {
-                    detail: "admission value is NULL".to_string(),
-                })?;
-            let value = Value::from_json(&value_json).map_err(|e| AccessError::InvalidRecord {
-                detail: format!("admission value invalid: {e}"),
-            })?;
-            match value {
-                Value::Text(descriptor) => out.push((operation, descriptor)),
-                _ => {
-                    return Err(AccessError::InvalidRecord {
-                        detail: "admission value is not text".to_string(),
-                    })
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
-struct CheckedCredential {
-    matched: IssueRow,
-    max_gen: u32,
-}
-
-impl CheckedCredential {
-    fn role_kind(&self) -> Result<RoleKind, AccessError> {
-        RoleKind::parse(&self.matched.role).map_err(|e| AccessError::InvalidRecord {
-            detail: format!("stored role invalid: {e}"),
-        })
-    }
-
-    fn matched_cap(&self) -> Result<CapabilityName, AccessError> {
-        CapabilityName::parse(&self.matched.cap).map_err(|e| AccessError::InvalidRecord {
-            detail: format!("stored capability invalid: {e}"),
-        })
-    }
-
-    fn matched_key(&self) -> Result<KeyId, AccessError> {
-        KeyId::parse(&self.matched.key_id).map_err(|e| AccessError::InvalidRecord {
-            detail: format!("stored key id invalid: {e}"),
-        })
-    }
-
-    fn enter_report(&self) -> EnterReport {
-        EnterReport {
-            capability: self.matched.cap.clone(),
-            scope: self.matched.scope.clone(),
-            ceiling: self.matched.ceiling,
-            role: self.matched.role.clone(),
-            cap_generation: self.matched.capgen,
-        }
-    }
-}
-
-fn assert_schema_generation() {
-    debug_assert_eq!(
-        ACCESS_SCHEMA_GENERATION, SCHEMA_GENERATION,
-        "access is bound to the PR03 0001 baseline"
-    );
-    assert_eq!(
-        ACCESS_SCHEMA_GENERATION, SCHEMA_GENERATION,
-        "access is bound to the PR03 0001 baseline"
-    );
-}
-
-fn marker_reason_entity(user: &UserId) -> CapabilityName {
-    // The bootstrap marker reuses the user text as its entity anchor (both
-    // share the validated alphabet); a mismatch with the descriptor fails
-    // closed at read time.
-    CapabilityName::parse(user.as_str()).expect("frozen user text is a valid capability anchor")
-}
-
-fn insert_admission(
-    store: &SqliteStore,
-    operation: &str,
-    capability: &CapabilityName,
-    descriptor: &str,
-    seq: u64,
-) -> Result<(), AccessError> {
-    let op = OperationId::parse(operation).map_err(|e| AccessError::InvalidRecord {
-        detail: format!("reserved admission operation invalid: {e}"),
-    })?;
-    let entity =
-        InstalledId::parse(capability.as_str()).map_err(|e| AccessError::InvalidRecord {
-            detail: format!("admission entity invalid: {e}"),
-        })?;
-    // The sensor column stays the shared synthetic sensor; the key identity
-    // travels inside the descriptor.
-    let sensor = frozen_sensor();
-    let value = Value::Text(descriptor.to_string());
-    let unit = access_unit();
-    store
-        .insert(
-            &op,
-            &entity,
-            &sensor,
-            &value,
-            &unit,
-            synthetic_times(),
-            &synthetic_record(seq),
-        )
-        .map_err(AccessError::Store)?;
-    Ok(())
-}
-
-fn access_row_count(store: &SqliteStore) -> Result<u64, AccessError> {
-    let script = format!(
-        "SELECT COUNT(*) FROM outbox WHERE operation LIKE {};",
-        sql_quote("access-%")
-    );
-    let rows = store.exec_script(&script).map_err(AccessError::Store)?;
-    let first = rows.first().ok_or_else(|| AccessError::InvalidRecord {
-        detail: "admission count returned no row".to_string(),
-    })?;
-    let raw = first.first().ok_or_else(|| AccessError::InvalidRecord {
-        detail: "admission count row is empty".to_string(),
-    })?;
-    raw.parse::<u64>().map_err(|_| AccessError::InvalidRecord {
-        detail: format!("admission count unreadable: '{raw}'"),
-    })
-}
-
-fn outbox_count(store: &SqliteStore) -> Result<u64, AccessError> {
-    let rows = store
-        .exec_script("SELECT COUNT(*) FROM outbox;")
-        .map_err(AccessError::Store)?;
-    let first = rows.first().ok_or_else(|| AccessError::InvalidRecord {
-        detail: "outbox count returned no row".to_string(),
-    })?;
-    let raw = first.first().ok_or_else(|| AccessError::InvalidRecord {
-        detail: "outbox count row is empty".to_string(),
-    })?;
-    raw.parse::<u64>().map_err(|_| AccessError::InvalidRecord {
-        detail: format!("outbox count unreadable: '{raw}'"),
-    })
-}
+mod context;
+mod gate;
+mod state;
+pub use context::{ActorContext, CapabilityPolicy};
+pub use gate::AccessGate;
 
 #[cfg(test)]
 mod tests {
@@ -1893,8 +1172,10 @@ mod tests {
             user: "synthetic-operator-1".to_string(),
             reason: "synthetic bootstrap; reason=1".to_string(),
             label: "synthetic".to_string(),
+            policy: CapabilityPolicy::entry_only(None),
         };
         let encoded = encode_issue(&row);
+        assert_eq!(encoded, "v=2;kind=issue;cap=reviewer-1;scope=scope-a;ceiling=1;role=reviewer;key=key-reviewer-1;keyfp=0123456789abcdef;issuer=bootstrap-issuer-1;capgen=1;user=synthetic-operator-1;reason=synthetic bootstrap%3B reason%3D1;label=synthetic;admin=none;scopes=;expires=none");
         let (kind, map) = decode_descriptor(&encoded).expect("decode");
         assert_eq!(kind, "issue");
         assert_eq!(decode_issue(&map).expect("issue"), row);
@@ -1927,6 +1208,7 @@ mod tests {
             user: "synthetic-operator-1".to_string(),
             reason: "synthetic caf\u{e9} rotation".to_string(),
             label: "synth\u{e9}tique".to_string(),
+            policy: CapabilityPolicy::entry_only(None),
         };
         let encoded = encode_issue(&row);
         assert!(
@@ -1941,6 +1223,11 @@ mod tests {
     #[test]
     fn access_error_codes_are_stable() {
         let cases: Vec<(AccessError, &str)> = vec![
+            (AccessError::AdministrationDenied, "administration-denied"),
+            (AccessError::PolicyDenied { detail: "x".into() }, "policy-denied"),
+            (AccessError::ExpiredCredential { expires_at_ms: 0 }, "expired-credential"),
+            (AccessError::GenerationOverflow { capability: "c".into() }, "generation-overflow"),
+            (AccessError::MutationUnknown { operation: OperationId::parse("op-1").unwrap(), detail: "x".into() }, "mutation-unknown"),
             (
                 AccessError::AlreadyBootstrapped {
                     detail: "x".to_string(),

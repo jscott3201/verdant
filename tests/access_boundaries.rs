@@ -29,7 +29,7 @@ mod access;
 
 use access::{
     refuse_remote_listener, AccessGate, BootstrapCredentials, CapabilityName, Credential,
-    DisplayLabel, IssuerId, KeyId, Reason, RoleKind, SyntheticKey,
+    DisplayLabel, KeyId, Reason, RoleKind, SyntheticKey,
 };
 use domain::scope::TrustedScope;
 use std::path::{Path, PathBuf};
@@ -250,7 +250,7 @@ fn rebootstrap_is_a_typed_refusal_without_overwrite() {
 #[test]
 fn issuance_is_scope_limited_and_ceiling_bound() {
     let scratch = Scratch::new("issuance");
-    let (gate, _) = open_gate(&scratch, "access.db", &reason("issuance"));
+    let (gate, creds) = open_gate(&scratch, "access.db", &reason("issuance"));
     let cap = CapabilityName::parse("auditor-1").expect("cap");
     let key_id = KeyId::parse("key-auditor-1").expect("key id");
     let key = synthetic_key("issuance", "auditor");
@@ -262,7 +262,7 @@ fn issuance_is_scope_limited_and_ceiling_bound() {
             RoleKind::Reviewer,
             &key_id,
             &key,
-            gate.issuer(),
+            &creds.publisher,
             &reason("issuance-auditor"),
             &label("synthetic"),
         )
@@ -286,7 +286,7 @@ fn issuance_is_scope_limited_and_ceiling_bound() {
             RoleKind::Reviewer,
             &KeyId::parse("key-too-high-1").expect("key"),
             &synthetic_key("issuance", "high"),
-            gate.issuer(),
+            &creds.publisher,
             &reason("issuance-high"),
             &label("synthetic"),
         )
@@ -304,7 +304,7 @@ fn issuance_is_scope_limited_and_ceiling_bound() {
             RoleKind::Reviewer,
             &KeyId::parse("key-auditor-2").expect("key"),
             &synthetic_key("issuance", "auditor2"),
-            gate.issuer(),
+            &creds.publisher,
             &reason("issuance-dup"),
             &label("synthetic"),
         )
@@ -356,7 +356,7 @@ fn forged_mint_and_unknown_issuer_are_refused() {
     );
     // Unknown issuer at mint time is refused before any write.
     let before = gate.admission_count().expect("count");
-    let unknown = IssuerId::parse("unknown-issuer-9").expect("issuer");
+    assert!(sqlite_raw(gate.db_path(), "UPDATE outbox SET value_json=replace(value_json, 'issuer=bootstrap-issuer-1', 'issuer=unknown-issuer-9') WHERE entity='reviewer-1';").0);
     assert_eq!(
         gate.issue(
             &CapabilityName::parse("stranger-1").expect("cap"),
@@ -365,7 +365,7 @@ fn forged_mint_and_unknown_issuer_are_refused() {
             RoleKind::Reviewer,
             &KeyId::parse("key-stranger-1").expect("key"),
             &synthetic_key("forgery", "stranger"),
-            &unknown,
+            &creds.reviewer,
             &reason("forgery-stranger"),
             &label("synthetic"),
         )
@@ -844,7 +844,7 @@ fn reviewer_cannot_publish_static_separation() {
             RoleKind::Reviewer,
             &KeyId::parse("key-reviewer-high-1").expect("key"),
             &synthetic_key("separation", "high"),
-            gate.issuer(),
+            &creds.publisher,
             &reason("separation-high"),
             &label("synthetic"),
         )
