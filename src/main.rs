@@ -26,6 +26,10 @@ mod native;
 // surface change in this slice).
 #[allow(dead_code)]
 mod semantics;
+// M01-PR07 equipment and proposed bindings (scoped records + proposals).
+// Wiring only: the CLI surface is unchanged in this slice.
+#[allow(dead_code)]
+mod binding;
 
 use config::{load_from_path, Role};
 use std::env;
