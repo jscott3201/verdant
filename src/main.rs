@@ -18,6 +18,10 @@ mod storage;
 // Wiring only: the CLI surface is unchanged in this slice.
 #[allow(dead_code)]
 mod access;
+// M01-PR05 Selene native lifecycle (single public/native facade).
+// Wiring only: the CLI surface is unchanged in this slice.
+#[allow(dead_code)]
+mod native;
 // M01-PR06 offline vocabulary import and conversion (pure/offline; no CLI
 // surface change in this slice).
 #[allow(dead_code)]
