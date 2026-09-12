@@ -10,6 +10,10 @@ mod config;
 // Allowed dead code until PR03/PR04/PR05/PR06 consume these types.
 #[allow(dead_code)]
 mod domain;
+// M01-PR03 durable stores (SQLite envelope over the system sqlite3 CLI).
+// Wiring only: the CLI surface is unchanged in this slice.
+#[allow(dead_code)]
+mod storage;
 
 use config::{load_from_path, Role};
 use std::env;
