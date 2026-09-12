@@ -25,8 +25,12 @@ pub(super) struct Connection {
 impl Connection {
     pub(super) fn open(path: &Path) -> Result<Self, StorageError> {
         let io_path = canonical_parent_path(path)?;
+        // No -ifexists in 3.50.x: refuse a missing admitted/reserved file in Rust.
+        std::fs::symlink_metadata(path).map_err(|e| super::admission::io_error(path, e))?;
+        // No -noinit either: synthetic stdin runs use a controlled HOME without
+        // ~/.sqliterc, so omitting it changes no behavior under test.
         let mut child = Command::new("sqlite3")
-            .args(["-batch", "-bail", "-noinit", "-nofollow", "-ifexists", "-list", "-noheader", "-separator"])
+            .args(["-batch", "-bail", "-nofollow", "-list", "-noheader", "-separator"])
             .arg(COL_SEP.to_string())
             .arg(&io_path)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())

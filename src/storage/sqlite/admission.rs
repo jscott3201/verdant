@@ -355,12 +355,13 @@ mod tests {
         fs::remove_file(&private.0).expect("simulate lost private file");
         let error = initialize(&private.0, &ConnectionSettings::local_wal_full(), &StoreBounds::tiny(), "fixture")
             .map_err(|e| private.public_error(&path, e)).unwrap_err();
+        assert!(matches!(&error, StorageError::Io { path: reported, .. } if reported == &path.display().to_string()));
         let detail = error.to_string();
         assert!(detail.contains(path.to_str().expect("public path")), "{detail}");
         assert!(!detail.contains(".verdant-bootstrap-"), "{detail}");
         assert!(!detail.contains(scratch.0.join("real").to_str().expect("physical parent")), "{detail}");
         assert!(scratch.entries().is_empty());
-        assert!(!path.exists(), "-ifexists must not recreate a lost file");
+        assert!(!path.exists(), "Rust admission must not recreate a lost file");
         let missing = scratch.0.join("public/missing/store.db");
         let error = Connection::open(&missing).err().expect("missing parent refusal");
         assert!(matches!(error, StorageError::Io { path, .. } if path == missing.display().to_string()));

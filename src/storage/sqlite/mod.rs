@@ -804,11 +804,11 @@ fn run_script_stdin(
     extra_args: &[&str],
     script: &str,
 ) -> Result<Output, StorageError> {
-    // The reference schema is in-memory; filesystem opens share leaf refusal.
+    // No -noinit on 3.50.x; synthetic stdin runs use HOME without ~/.sqliterc.
     let io_path = if db_path == Path::new(":memory:") { db_path.to_path_buf() }
         else { connection::canonical_parent_path(db_path)? };
     let mut child = Command::new("sqlite3")
-        .args(["-batch", "-noinit", "-nofollow"])
+        .args(["-batch", "-nofollow"])
         .args(extra_args)
         .arg(&io_path)
         .stdin(Stdio::piped())

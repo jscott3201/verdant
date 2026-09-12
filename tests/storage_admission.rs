@@ -36,7 +36,8 @@ fn open(path: &Path) -> Result<(SqliteStore, storage::sqlite::OpenReport), Stora
     SqliteStore::open(path, ConnectionSettings::local_wal_full(), StoreBounds::tiny())
 }
 fn raw(path: &Path, sql: &str) -> String {
-    let mut child = Command::new("sqlite3").args(["-batch", "-bail", "-noinit"]).arg(path)
+    // 3.50.x has no -noinit; these stdin fixtures use HOME without ~/.sqliterc.
+    let mut child = Command::new("sqlite3").args(["-batch", "-bail"]).arg(path)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("sqlite");
     child.stdin.take().expect("stdin").write_all(sql.as_bytes()).expect("SQL");
     let out = child.wait_with_output().expect("exit");
