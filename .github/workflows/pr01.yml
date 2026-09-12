@@ -11,8 +11,12 @@
 #                    explicit codes; job-level timeout-minutes is an outer
 #                    failure bound, never a stop inference.
 #
-# Least privilege: contents:read. External actions should be SHA-pinned by
-# the integration owner at merge time (currently tag-pinned; see handoff).
+# Least privilege: contents:read. Checkout is pinned to the exact v4 commit
+# observed in successful PR19 run 34714433781 (not a moving tag).
+# No cache restore/save exists: each hosted product run builds/tests in a fresh
+# checkout, clean-room with respect to project artifacts (not a hermetic OS).
+# The test-log digest is supplemental; green product CI at the delivered head
+# plus the tested checkout SHA is the anchor, not a self-referential report hash.
 
 name: pr01
 
@@ -33,7 +37,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout (setup layer)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 as observed in PR19
         with:
           fetch-depth: 0
 
@@ -81,6 +85,48 @@ jobs:
             echo "selection=product" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: SQLite CLI flag compatibility (product execution)
+        if: steps.classify.outputs.selection == 'product'
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # Conservative extractor, NOT a Rust parser. Freeze the reviewed command/
+          # argument surface as well as scanning quoted options, including callers
+          # of the extra_args wrapper. Any surface drift requires reviewing this
+          # extractor; never just refresh the digest to make CI green. Inline test
+          # calls are harmlessly included; dedicated *_tests.rs are not product.
+          surface="$(git grep -hE 'Command::|\.args?\(|run_script(_stdin)?\(|"-{1,2}[[:alnum:]][[:alnum:]-]*"' -- src/storage ':(exclude)src/storage/sqlite/*_tests.rs')"
+          digest="$(printf '%s\n' "$surface" | shasum -a 256 | awk '{print $1}')"
+          if [ "$digest" != 377203c4df62680336b5b0aa426bcc97d9854ebce820d51940d44a357e1e9968 ]; then
+            printf '%s\n' "$surface"
+            echo '::error::SQLite argument surface changed; review flag extraction before execution.'
+            exit 1
+          fi
+          # Only these reviewed non-CLI literals are excluded: id -u, WAL/SHM suffixes.
+          flags="$(printf '%s\n' "$surface" | grep -oE '"-{1,2}[[:alnum:]][[:alnum:]-]*"' | tr -d '"' | grep -vE '^-(u|wal|shm)$' | sort -u)"
+          test -n "$flags"
+          printf 'Source-derived sqlite3 flags:\n%s\n' "$flags"
+          # sqlite3 -help writes stderr and may exit 1 even on success. Require
+          # recognizable option rows below, not that help's exit status is zero.
+          help="$(sqlite3 -help 2>&1 || true)"
+          options="$(printf '%s\n' "$help" | awk '$1 == "-[no]header" {print "-header"; print "-noheader"; next} $1 ~ /^-[a-z]/ {print $1}')"
+          args=()
+          while IFS= read -r flag; do
+            # Normalize one or two leading hyphens for the help spelling only.
+            case "$flag" in --*) option="-${flag#--}" ;; *) option="$flag" ;; esac
+            if ! printf '%s\n' "$options" | grep -Fx -- "$option"; then
+              echo "::error::CI sqlite3 lacks product flag $flag"
+              exit 1
+            fi
+            case "$flag" in
+              --version) sqlite3 "$flag" ;;
+              -separator) args+=("$flag" '|') ;;
+              *) args+=("$flag") ;;
+            esac
+          done <<< "$flags"
+          # Also exercise exact argv spellings, without creating a database file.
+          test "$(sqlite3 "${args[@]}" :memory: 'SELECT 1;')" = 1
+
       - name: Build — one supported target first (product execution)
         if: steps.classify.outputs.selection == 'product'
         run: |
@@ -90,6 +136,20 @@ jobs:
           rustc -V
           cargo -V
           rustc -vV | grep host || true
+
+      - name: SQLite linkage and Selene lockfile evidence (product execution)
+        if: steps.classify.outputs.selection == 'product'
+        run: |
+          set -euo pipefail
+          linkage="$(otool -L ./target/debug/verdant)"
+          printf '%s\n' "$linkage"
+          if printf '%s\n' "$linkage" | grep -iq sqlite; then
+            echo '::error::unexpected SQLite dynamic linkage'
+            exit 1
+          fi
+          echo 'No SQLite dynamic library in this binary; this is not a static-link audit.'
+          echo '--- Selene package version and exact source revision from Cargo.lock ---'
+          awk '/^\[\[package\]\]/ {selene=0} /^name = "selene-db"$/ {selene=1; found=1} selene && /^(name|version|source) =/ {print} END {if (!found) exit 1}' Cargo.lock
 
       - name: Test — full run, empty execution fails (product execution)
         if: steps.classify.outputs.selection == 'product'
@@ -102,6 +162,8 @@ jobs:
             echo "::error::empty tests: 0 tests executed — an empty run does NOT pass."
             exit 3
           fi
+          echo '--- SHA-256 of the captured full test log (supplemental CI evidence) ---'
+          shasum -a 256 pr01-test.log
 
       - name: Evidence report (product execution)
         if: steps.classify.outputs.selection == 'product'
@@ -146,7 +208,7 @@ jobs:
           sysctl -n hw.ncpu || true
           sysctl -n hw.memsize || true
           df -h . || true
-          echo "--- sqlite (system, NOT linked in PR01) ---"
+          echo "--- sqlite (system CLI; linkage checked separately on product runs) ---"
           sqlite3 --version || true
           echo "--- selection ---"
           echo "selection=${{ steps.classify.outputs.selection }}"
