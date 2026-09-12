@@ -6,6 +6,10 @@
 //! evidence-completeness report are subcommands, not a new platform.
 
 mod config;
+// M01-PR02 shared domain (representation only; no CLI behavior change here).
+// Allowed dead code until PR03/PR04/PR05/PR06 consume these types.
+#[allow(dead_code)]
+mod domain;
 
 use config::{load_from_path, Role};
 use std::env;
