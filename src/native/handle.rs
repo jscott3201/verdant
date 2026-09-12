@@ -54,6 +54,7 @@ use super::{CHANNEL_IDENTITY, FORMAT_ID, SELENE_CRATE_VERSION, SELENE_REV};
 #[path = "maintenance.rs"]
 mod maintenance;
 use maintenance::CachedCheckpoint;
+pub(crate) use maintenance::CustodyAccess;
 
 /// Frozen synthetic lifecycle catalog layout (proven by the Selene facade
 /// doctests at the pinned rev; synthetic only, never field data).
@@ -128,6 +129,7 @@ struct Shared {
     graph: ObjectPath,
     gate: AdmissionGate,
     checkpoint: Mutex<Option<CachedCheckpoint>>,
+    custody: Mutex<Option<Arc<dyn super::CustodyGuard>>>,
 }
 
 impl fmt::Debug for Shared {
@@ -193,6 +195,7 @@ impl NativeHandle {
             graph,
             gate: AdmissionGate::new(settings.bounds.max_inflight),
             checkpoint: Mutex::new(None),
+            custody: Mutex::new(None),
         });
         let handle = NativeHandle { shared };
         let report = handle.open_report(None)?;
@@ -223,6 +226,7 @@ impl NativeHandle {
             graph,
             gate: AdmissionGate::new(settings.bounds.max_inflight),
             checkpoint: Mutex::new(None),
+            custody: Mutex::new(None),
         });
         let handle = NativeHandle { shared };
         let report = handle.open_report(recovery)?;

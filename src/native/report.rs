@@ -12,6 +12,25 @@ use std::time::Duration;
 use super::settings::NativeSettings;
 use super::{MaintenancePlan, NativeError};
 
+/// Application-owned retention evidence, not a competing Selene lease. No
+/// candidate-only prune API exists at the pin: a live reference conservatively
+/// refuses the entire prune pass. Empty/unavailable guard evidence fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyPlan {
+    pub live_seals: Vec<String>,
+    pub generations: Vec<u64>,
+    pub detail: String,
+    /// Preserve the successful checkpoint when maintain's prune half refuses.
+    pub checkpoint: Option<Box<CheckpointReport>>,
+}
+
+/// Installed once per native owner by the application. Invoked while holding
+/// the same facade mutex used for seal admission/release, through deletion.
+/// Implementations must not re-enter native custody or maintenance methods.
+pub(crate) trait CustodyGuard: Send + Sync {
+    fn check_prune(&self) -> Result<(), CustodyPlan>;
+}
+
 /// Closed (dropped) store authority: the directory plus the settings to
 /// reopen it with. The writer lease is released only when every
 /// [`crate::native::NativeHandle`] clone AND every session they minted is

@@ -82,6 +82,10 @@ mod settings;
 pub use error::NativeError;
 #[allow(unused_imports)]
 pub use handle::NativeHandle;
+pub(crate) use report::CustodyGuard;
+#[allow(unused_imports)]
+pub(crate) use handle::CustodyAccess;
+pub use report::CustodyPlan;
 #[allow(unused_imports)]
 pub use report::{
     CheckpointOutcome, CheckpointReport, ClosedStore, ExecReport, MaintenanceOutcome, OpenReport, PruneOutcome, PruneReport,
