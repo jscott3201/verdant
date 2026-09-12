@@ -409,7 +409,8 @@ fn migration_0002_receipts_coexist_with_generation_1_consumers() {
     // 3 access rows (bootstrap) + 9 binding rows.
     assert_eq!(total, 12, "access + binding rows share the 0001 outbox");
     let receipts = registry.store().exec_script("SELECT COUNT(*) FROM storage_receipts;").expect("receipts");
-    assert_eq!(receipts[0][0], "12", "receipts are separate, not outbox history");
+    // Receipts are transaction-level, not row-level: 1 atomic bootstrap + 9 binding transactions.
+    assert_eq!(receipts[0][0], "10", "receipts are separate, not outbox history");
     drop(registry);
     let registry = open_registry(&scratch, "mig.db");
     assert_eq!(registry.revision().as_u32(), 9);

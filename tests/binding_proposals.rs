@@ -298,7 +298,7 @@ fn shared_sensor_is_one_source_for_both_vavs() {
             &access::KeyId::parse("key-publisher-b").expect("key id"),
             &access::SyntheticKey::parse(&format!("synthetic-shared-{}-b", std::process::id()))
                 .expect("key"),
-            &access::IssuerId::parse("bootstrap-issuer-1").expect("issuer"),
+            &creds.publisher,
             &reason("scope-b-issue"),
             &access::DisplayLabel::parse("synthetic").expect("label"),
         )

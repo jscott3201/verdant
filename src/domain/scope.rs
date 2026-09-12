@@ -1,11 +1,12 @@
-//! Trusted scope and credential ceiling (validated construction only).
+//! Scope and credential ceiling representations (syntax validation only).
 //!
 //! A caller-provided tenant/role string never *is* a trusted context. It
-//! becomes one only through [`TrustedScope::parse`], which validates the text
-//! against the same alphabet/length rules as [`super::ids::ScopeId`]. There is
+//! does not become one through [`TrustedScope::parse`], which only validates
+//! the alphabet/length rules of [`super::ids::ScopeId`]. Authentication and
+//! actor-context construction belong exclusively to access. There is
 //! intentionally no `From<String>`, `From<&str>` or `Default` for
-//! [`TrustedScope`] or [`CredentialCeiling`]: manufacturing trusted context
-//! without validation must be a compile error, not a runtime surprise.
+//! [`TrustedScope`] or [`CredentialCeiling`]: these constructors validate
+//! representation, never grant authority or prove an issued policy.
 //!
 //! Frozen examples: `"scope-a"`, `"scope-b"` with ceiling levels `0..=3`
 //! (see [`MAX_CEILING_LEVEL`]). PR04 (access) consumes these types; PR02
@@ -20,14 +21,14 @@
 use super::ids::ScopeId;
 use super::Error;
 
-/// Trusted scope handle. Private field: construction is validated only.
+/// Syntactically validated scope handle; not evidence of authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TrustedScope {
     id: ScopeId,
 }
 
 impl TrustedScope {
-    /// Validate caller text into trusted scope context.
+    /// Validate caller scope text, without authenticating it.
     ///
     /// Accepts the frozen examples `"scope-a"`/`"scope-b"` and any other
     /// syntactically valid scope id; refuses empty, over-long and
@@ -38,7 +39,7 @@ impl TrustedScope {
         })
     }
 
-    /// Lift an already-validated [`ScopeId`] into trusted context.
+    /// Lift an already-validated [`ScopeId`] into a scope representation.
     ///
     /// This is still a validated path: the `ScopeId` could only have come
     /// from [`ScopeId::parse`]. Raw strings must go through [`Self::parse`].
@@ -71,14 +72,14 @@ impl TrustedScope {
     }
 }
 
-/// Issuance-controlled upper capability bound for a scope.
+/// Representable upper capability bound for a scope, not an issued grant.
 ///
 /// `level` is a small integer `0..=MAX_CEILING_LEVEL`. Higher values are
 /// refused rather than clamped. The scope travels with the ceiling so a
 /// ceiling cannot be silently re-targeted at another scope.
 pub const MAX_CEILING_LEVEL: u8 = 3;
 
-/// Validated credential ceiling bound to one trusted scope.
+/// Validated ceiling representation bound to one syntactically valid scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialCeiling {
     scope: TrustedScope,
