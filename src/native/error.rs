@@ -43,6 +43,8 @@ pub enum NativeError {
     /// Observed store/maintenance capacity or a Selene resource budget exhausted.
     /// Operator action is required; not a host-global quota or disk-full proof.
     MaintenanceRequired { detail: String },
+    /// Application seal custody refuses deletion; not capacity or authority.
+    Custody { plan: super::CustodyPlan },
     /// Native durable filesystem mode is unavailable on this platform.
     UnsupportedPlatform { detail: String },
     /// CURRENT may select a complete new snapshot. Never retry blindly.
@@ -84,6 +86,7 @@ impl NativeError {
             NativeError::Busy { .. } => "busy",
             NativeError::ResourceLimit { .. } => "resource-limit",
             NativeError::MaintenanceRequired { .. } => "maintenance-required",
+            NativeError::Custody { .. } => "seal-custody",
             NativeError::UnsupportedPlatform { .. } => "unsupported-platform",
             NativeError::CheckpointUncertain { .. } => "checkpoint-uncertain",
             NativeError::Fenced { .. } => "fenced",
@@ -196,7 +199,7 @@ impl NativeError {
             | Self::ResourceLimit { .. } | Self::UnsupportedPlatform { .. }
             | Self::CheckpointUncertain { .. } | Self::Fenced { .. }
             | Self::Integrity { .. } | Self::Semantic { .. } | Self::StatementRejected { .. }
-            | Self::Io { .. } | Self::Lifecycle { .. } => None,
+            | Self::Io { .. } | Self::Lifecycle { .. } | Self::Custody { .. } => None,
         }
     }
 }
@@ -247,6 +250,7 @@ impl fmt::Display for NativeError {
                 )
             }
             NativeError::MaintenanceRequired { detail } => write!(f, "native maintenance required: {detail}"),
+            NativeError::Custody { plan } => write!(f, "native prune refused by application seal custody: {plan:?}"),
             NativeError::UnsupportedPlatform { detail } => write!(f, "native platform unsupported: {detail}"),
             NativeError::CheckpointUncertain { detail } => write!(f, "native checkpoint uncertain (drop all owners and inspect on reopen; never retry blindly): {detail}"),
             NativeError::Fenced { detail } => {

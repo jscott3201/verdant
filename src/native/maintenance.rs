@@ -8,7 +8,47 @@ pub(super) struct CachedCheckpoint {
     report: CheckpointReport,
 }
 
+/// A locked application admission window. Callers can install once or prove
+/// they are the installed owner, but cannot clear or replace the native guard.
+pub(crate) struct CustodyAccess<'a> {
+    slot: std::sync::MutexGuard<'a, Option<Arc<dyn super::super::CustodyGuard>>>,
+}
+impl CustodyAccess<'_> {
+    pub(crate) fn is_installed(&self) -> bool { self.slot.is_some() }
+    pub(crate) fn matches(&self, guard: &Arc<dyn super::super::CustodyGuard>) -> bool {
+        self.slot.as_ref().is_some_and(|installed| Arc::ptr_eq(installed, guard))
+    }
+    pub(crate) fn install(&mut self, guard: Arc<dyn super::super::CustodyGuard>) -> Result<(), NativeError> {
+        if self.slot.is_some() { return Err(NativeError::Custody { plan: custody_unavailable("application custody guard replacement refused") }); }
+        *self.slot = Some(guard);
+        Ok(())
+    }
+}
+
 impl NativeHandle {
+    /// Sibling sidecar, never a foreign file inside Selene's closed directory.
+    /// Its presence requires application guard recovery even after raw reopen.
+    /// Trusted parent/guarded writers are required; deleting it externally is
+    /// tampering, not a supported way to release custody.
+    pub(crate) fn custody_path(&self) -> Result<PathBuf, NativeError> {
+        let dir = std::fs::canonicalize(&self.shared.dir).map_err(|e| NativeError::Io {
+            path: self.shared.dir.display().to_string(), message: e.to_string(),
+        })?;
+        let name = dir.file_name().ok_or_else(|| NativeError::invalid_input("custody", "native root needs a parent"))?;
+        let mut sidecar = std::ffi::OsString::from(".");
+        sidecar.push(name);
+        sidecar.push(".verdant-seal-custody-v1");
+        Ok(dir.with_file_name(sidecar))
+    }
+
+    pub(crate) fn custody_lock(&self) -> Result<CustodyAccess<'_>, NativeError> {
+        match self.shared.custody.try_lock() {
+            Ok(slot) => Ok(CustodyAccess { slot }),
+            Err(std::sync::TryLockError::WouldBlock) => Err(NativeError::Busy { detail: "application custody window active; refusing, not queueing".into() }),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(NativeError::Custody { plan: custody_unavailable("application custody lock poisoned") }),
+        }
+    }
+
     fn maintenance_plan(&self) -> Result<MaintenancePlan, NativeError> {
         self.shared.settings.bounds.plan_maintenance(self.store_bytes()?)
     }
@@ -73,6 +113,16 @@ impl NativeHandle {
     /// is distinct from a completed (possibly zero-byte) reclaim pass.
     pub fn prune(&self) -> Result<PruneOutcome, NativeError> {
         let _admission = self.shared.gate.try_enter()?;
+        let custody = self.custody_lock()?;
+        let refusal = match custody.slot.as_ref() {
+            Some(guard) => guard.check_prune().err(),
+            None => match std::fs::symlink_metadata(self.custody_path()?) {
+                Ok(_) => Some(custody_unavailable("seal sidecar present; reopen the application guard before pruning")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => Some(custody_unavailable("seal sidecar cannot be inspected")),
+            },
+        };
+        if let Some(plan) = refusal { return Err(NativeError::Custody { plan }); }
         let plan = self.maintenance_plan()?;
         if !plan.admitted() {
             return Ok(PruneOutcome::RefusedExhausted { plan, detail: format!("prune plan exhausted: {plan:?}") });
@@ -103,10 +153,22 @@ impl NativeHandle {
             CheckpointOutcome::Completed(report) => report,
             CheckpointOutcome::RefusedExhausted { plan, detail } => return Ok(MaintenanceOutcome::RefusedExhausted { checkpoint: None, plan, detail }),
         };
-        match self.prune()? {
+        let prune = match self.prune() {
+            Ok(prune) => prune,
+            Err(NativeError::Custody { mut plan }) => {
+                plan.checkpoint = Some(Box::new(checkpoint));
+                return Err(NativeError::Custody { plan });
+            }
+            Err(error) => return Err(error),
+        };
+        match prune {
             PruneOutcome::Reclaimed(prune) => Ok(MaintenanceOutcome::Completed(MaintenanceReport { checkpoint, prune })),
             PruneOutcome::CleanupIncomplete(prune) => Ok(MaintenanceOutcome::CleanupIncomplete(MaintenanceReport { checkpoint, prune })),
             PruneOutcome::RefusedExhausted { plan, detail } => Ok(MaintenanceOutcome::RefusedExhausted { checkpoint: Some(checkpoint), plan, detail }),
         }
     }
+}
+
+fn custody_unavailable(detail: &str) -> super::super::CustodyPlan {
+    super::super::CustodyPlan { live_seals: Vec::new(), generations: Vec::new(), detail: detail.into(), checkpoint: None }
 }

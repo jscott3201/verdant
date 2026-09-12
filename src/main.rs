@@ -30,6 +30,7 @@ mod semantics;
 // Wiring only: the CLI surface is unchanged in this slice.
 #[allow(dead_code)]
 mod binding;
+mod seal;
 
 use config::{load_from_path, Role};
 use std::env;
