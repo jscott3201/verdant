@@ -476,19 +476,25 @@ impl NativeHandle {
                 message: "store directory does not exist (create it first; the facade creates no directories)".to_string(),
             });
         }
-        // Probe writability without mutating the store: a temp file that is
-        // removed before any Selene call. Failure is a typed refusal.
+        // Atomically create a probe that this call owns. Never truncate or
+        // follow a pre-existing probe path (including a dangling symlink).
+        // A collision is a refusal, not permission to remove someone else's
+        // artifact. The directory must still be trusted against concurrent
+        // hostile replacement; this is not a general filesystem sandbox.
         let probe = dir.join(".verdant-write-probe");
-        match std::fs::write(&probe, b"probe") {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&probe);
-                Ok(())
-            }
-            Err(e) => Err(NativeError::Io {
-                path: dir.display().to_string(),
-                message: format!("store directory is not writable: {e}"),
-            }),
-        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|e| NativeError::Io {
+                path: probe.display().to_string(),
+                message: format!("cannot create a fresh writability probe: {e}"),
+            })?;
+        drop(file);
+        std::fs::remove_file(&probe).map_err(|e| NativeError::Io {
+            path: probe.display().to_string(),
+            message: format!("cannot remove the probe created by this call: {e}"),
+        })
     }
 
     fn lifecycle_graph() -> Result<ObjectPath, NativeError> {
@@ -548,3 +554,7 @@ fn measure_store_bytes(dir: &Path) -> Result<u64, String> {
     }
     Ok(total)
 }
+
+#[cfg(test)]
+#[path = "probe_tests.rs"]
+mod probe_tests;
