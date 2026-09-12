@@ -241,11 +241,18 @@ impl ProposedBinding {
         }
     }
 
-    /// Canonical bytes for stable finding digests (field order frozen).
+    /// Versioned input for synthetic finding digests, including lifecycle status.
+    ///
+    /// The original representation omitted status, so different finding summaries
+    /// could receive identical IDs at the same revision and fingerprint. V2
+    /// deliberately changes newly derived IDs. Stored legacy findings remain
+    /// unchanged on replay; they must not be relabeled as recomputed v2 evidence.
+    /// This input format and its current synthetic FNV consumer are not a
+    /// cryptographic seal or proof of observed qualification.
     pub fn canonical_bytes(&self) -> String {
         let mode_text = self.mode.as_ref().map(|m| m.as_str()).unwrap_or("-");
         format!(
-            "{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
+            "binding-canonical-v2\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
             self.endpoint.as_str(),
             self.endpoint_class.as_str(),
             self.endpoint_scope.as_str(),
@@ -258,6 +265,7 @@ impl ProposedBinding {
             self.requested.as_str(),
             self.effective.as_str(),
             self.feedback.as_str(),
+            self.status.as_str(),
         )
     }
 }
@@ -333,4 +341,58 @@ pub fn propose(
         feedback,
         status: BindingStatus::Valid,
     })
+}
+
+#[cfg(test)]
+mod finding_identity_regressions {
+    use super::*;
+    use crate::binding::findings::Finding;
+    use crate::domain::ids::BindingRevision;
+
+    fn fixture() -> ProposedBinding {
+        ProposedBinding::from_import(
+            EndpointAddress::parse("bacnet://ahu-1").expect("fixture endpoint"),
+            EndpointClass::Service,
+            TrustedScope::parse("scope-a").expect("fixture scope"),
+            InstalledId::parse("ahu-1").expect("fixture equipment"),
+            PropertyName::parse("supply-air-temp").expect("fixture property"),
+            TrustedScope::parse("scope-a").expect("fixture scope"),
+            InstalledId::parse("sensor-sat-1").expect("fixture source"),
+            Unit::parse("degC").expect("fixture unit"),
+            None,
+            BindingRole::Sense,
+            BindingRole::Sense,
+            Feedback::Absent,
+            BindingStatus::Imported,
+        )
+    }
+
+    #[test]
+    fn identical_binding_preserves_versioned_finding_input() {
+        let binding = fixture();
+        let copy = binding.clone();
+        assert!(binding.canonical_bytes().starts_with("binding-canonical-v2\x1f"));
+        assert_eq!(binding.canonical_bytes(), copy.canonical_bytes());
+        let revision = BindingRevision::new(7);
+        assert_eq!(
+            Finding::for_binding(&binding, revision, "fixture-fingerprint"),
+            Finding::for_binding(&copy, revision, "fixture-fingerprint")
+        );
+    }
+
+    #[test]
+    fn changed_lifecycle_status_cannot_share_finding_identity() {
+        let imported = fixture();
+        let mut valid = imported.clone();
+        // Direct field assignment is confined to this private regression fixture;
+        // it is not a qualification API or evidence of field observation.
+        valid.status = BindingStatus::Valid;
+        let revision = BindingRevision::new(7);
+        let first = Finding::for_binding(&imported, revision, "fixture-fingerprint");
+        let second = Finding::for_binding(&valid, revision, "fixture-fingerprint");
+        assert_ne!(first.summary(), second.summary());
+        assert_ne!(imported.canonical_bytes(), valid.canonical_bytes());
+        assert_ne!(first.digest(), second.digest());
+        assert_ne!(first.id(), second.id());
+    }
 }
