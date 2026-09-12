@@ -50,6 +50,30 @@ fn insert(handle: &NativeHandle, n: u64) {
     assert_eq!(handle.execute(&format!("INSERT (:Reading {{seq: {n}}})")).expect("insert").changes, Some(1));
 }
 
+fn wait_for_writer_release(dir: &Path) {
+    use std::fs::{OpenOptions, TryLockError};
+    use std::time::{Duration, Instant};
+    // Selene b65c234 holds LOCK in an Arc<File>, released by synchronous
+    // drop. CI nevertheless observed contention at the immediate next open.
+    // Synchronize setup on the actual lock, not a fixed delay or retried product
+    // operation. Never use this while testing a live owner's refusal.
+    let before = files(dir);
+    let lock = OpenOptions::new().read(true).write(true).open(dir.join("LOCK")).expect("existing LOCK");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) => {
+                assert!(Instant::now() < deadline, "writer LOCK not released: {}", dir.display());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+        }
+    }
+    lock.unlock().expect("release synchronization lock");
+    assert_eq!(before, files(dir), "release synchronization must not change the store");
+}
+
 #[test]
 fn r09_fixed_measurements() {
     let scratch = Scratch::new();
@@ -136,6 +160,7 @@ fn r09_maintenance_exact_boundaries_and_reserves() {
             let (handle, _) = NativeHandle::create(&scratch.0, NativeSettings::local()).expect("create");
             insert(&handle, 1);
             drop(handle);
+            wait_for_writer_release(&scratch.0);
             let measured = bytes(&scratch.0);
             let mut settings = NativeSettings::local();
             settings.bounds.native_reserve_bytes = 128;
@@ -208,11 +233,10 @@ fn r09_one_mib_budget_plan_and_validation() {
 fn r09_execute_statement_and_store_exact_boundaries() {
     for len in [63, 64, 65] {
         let scratch = Scratch::new();
-        let (handle, _) = NativeHandle::create(&scratch.0, NativeSettings::local()).expect("create");
-        drop(handle);
         let mut settings = NativeSettings::local();
         settings.bounds.max_statement_bytes = 64;
-        let (handle, _) = NativeHandle::open(&scratch.0, settings).expect("open");
+        // Statement admission needs no close/reopen transition.
+        let (handle, _) = NativeHandle::create(&scratch.0, settings).expect("create");
         let statement = format!("{:<len$}", "INSERT (:Reading {seq: 1})");
         assert_eq!(statement.len(), len);
         let before = files(&scratch.0);
@@ -230,6 +254,7 @@ fn r09_execute_statement_and_store_exact_boundaries() {
         let scratch = Scratch::new();
         let (handle, _) = NativeHandle::create(&scratch.0, NativeSettings::local()).expect("create");
         drop(handle);
+        wait_for_writer_release(&scratch.0);
         let mut settings = NativeSettings::local();
         settings.bounds.max_store_bytes = bytes(&scratch.0) + margin;
         let (handle, report) = NativeHandle::open(&scratch.0, settings).expect("at/below ceiling");
@@ -465,6 +490,10 @@ fn r09_native_sqlite_space_views_agree_qualitatively() {
     let (sqlite, _) = SqliteStore::open(&sqlite_dir.0.join("store.db"), ConnectionSettings::local_wal_full(), StoreBounds::tiny()).expect("SQLite");
     let native_initial = handle.store_bytes().expect("native initial");
     let sqlite_initial = sqlite.capacity_bytes();
+    let native_files_initial = bytes(&native_dir.0);
+    let sqlite_files_initial = bytes(&sqlite_dir.0);
+    assert_eq!(native_initial, native_files_initial);
+    assert_eq!(sqlite_initial, sqlite_files_initial);
     for n in 0..3 {
         insert(&handle, n);
         handle.checkpoint().and_then(native::CheckpointOutcome::completed).expect("managed snapshot");
@@ -479,8 +508,12 @@ fn r09_native_sqlite_space_views_agree_qualitatively() {
     }
     let native_written = handle.store_bytes().expect("native written");
     let sqlite_written = sqlite.capacity_bytes();
+    let native_files_written = bytes(&native_dir.0);
+    let sqlite_files_written = bytes(&sqlite_dir.0);
     assert!(native_written > native_initial);
     assert!(sqlite_written > sqlite_initial);
+    assert_eq!(native_written - native_initial, native_files_written - native_files_initial);
+    assert_eq!(sqlite_written - sqlite_initial, sqlite_files_written - sqlite_files_initial);
     let prune = match handle.prune().expect("native prune") {
         native::PruneOutcome::Reclaimed(report) => report,
         other => panic!("native reclaim incomplete: {other:?}"),
@@ -489,15 +522,23 @@ fn r09_native_sqlite_space_views_agree_qualitatively() {
     assert_eq!(checkpoint.busy, 0);
     let native_after = handle.store_bytes().expect("native after");
     let sqlite_after = sqlite.capacity_bytes();
+    let native_files_after = bytes(&native_dir.0);
+    let sqlite_files_after = bytes(&sqlite_dir.0);
     assert!(native_after < native_written);
-    // Short-lived SQLite connections may have already checkpointed: equal is
-    // honest, not evidence of reclaim. No equality of cross-engine counts.
-    assert!(sqlite_after <= sqlite_written);
+    // Each API view must move with its independent filesystem view in this
+    // run: both grow on writes, and native prune reclaims its reported bytes.
+    // SQLite checkpoint may grow, shrink, or retain main+WAL+SHM capacity
+    // (page allocation and short-lived connection cleanup vary by environment).
+    // Its signed delta must agree exactly with disk, but claims NO reclaim.
+    // Neither absolute byte expectations nor cross-engine byte equality apply.
+    let sqlite_checkpoint_delta = i128::from(sqlite_after) - i128::from(sqlite_written);
+    assert_eq!(sqlite_checkpoint_delta, i128::from(sqlite_files_after) - i128::from(sqlite_files_written));
+    assert_eq!(native_written - native_after, native_files_written - native_files_after);
     assert_eq!(sqlite.wal_size_bytes(), 0);
-    assert_eq!(native_after, bytes(&native_dir.0));
-    assert_eq!(sqlite_after, bytes(&sqlite_dir.0));
+    assert_eq!(native_after, native_files_after);
+    assert_eq!(sqlite_after, sqlite_files_after);
     assert_eq!(native_written - native_after, prune.removed_bytes);
     assert_eq!(handle.execute("MATCH (r:Reading) RETURN r").expect("native rows").row_count, Some(3));
     assert_eq!(sqlite.report().expect("SQLite rows").queued, 3);
-    println!("FIXED space views native whole-directory {native_initial} -> {native_written} -> {native_after}, Selene retained={}; SQLite main+WAL+SHM {sqlite_initial} -> {sqlite_written} -> {sqlite_after}; checkpoint={checkpoint:?}; directional agreement only", prune.retained_bytes);
+    println!("FIXED space views native whole-directory {native_initial} -> {native_written} -> {native_after}, Selene retained={}; SQLite main+WAL+SHM {sqlite_initial} -> {sqlite_written} -> {sqlite_after}; checkpoint={checkpoint:?}; SQLite checkpoint delta={sqlite_checkpoint_delta}; API/filesystem deltas agree; no SQLite reclaim claimed", prune.retained_bytes);
 }
