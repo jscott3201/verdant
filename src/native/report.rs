@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::settings::NativeSettings;
+use super::{MaintenancePlan, NativeError};
 
 /// Closed (dropped) store authority: the directory plus the settings to
 /// reopen it with. The writer lease is released only when every
@@ -123,6 +124,8 @@ pub struct ExecReport {
 /// One checkpoint: the exact immutable selection Selene published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointReport {
+    /// Pre-operation budget actually used for admission.
+    pub plan: MaintenancePlan,
     /// New immutable control manifest generation.
     pub generation: u64,
     /// Selected snapshot name (diagnostic only, not retention authority).
@@ -133,11 +136,35 @@ pub struct CheckpointReport {
     pub digest_hex: String,
     /// Store footprint after selection (disclosed, not promised).
     pub store_bytes_after: u64,
+    /// Exact complete WAL span covered by this snapshot (not the rotated base).
+    pub position: selene_db::DurableCommitPosition,
+    pub boundary_digest_hex: String,
+}
+
+/// Refusal has no invented generation, snapshot or reclaimed-byte measurements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointOutcome {
+    Completed(CheckpointReport),
+    RefusedExhausted { plan: MaintenancePlan, detail: String },
+}
+impl CheckpointOutcome {
+    pub fn completed(self) -> Result<CheckpointReport, NativeError> {
+        match self {
+            Self::Completed(report) => Ok(report),
+            Self::RefusedExhausted { detail, .. } => Err(NativeError::MaintenanceRequired { detail }),
+        }
+    }
 }
 
 /// One prune: explicit retention only (checkpoint never auto-prunes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PruneReport {
+    pub plan: MaintenancePlan,
+    /// Whole-directory measurements, not Selene's selected artifact subset.
+    pub store_bytes_before: u64,
+    pub store_bytes_after: u64,
+    /// Sum of Selene's retained artifact bytes (disclosed distinct space view).
+    pub retained_bytes: u64,
     /// Artifacts unlinked with directory synchronization.
     pub removed_count: usize,
     /// Bytes reclaimed by removal.
@@ -150,14 +177,52 @@ pub struct PruneReport {
     pub cleanup_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PruneOutcome {
+    /// Successful pass; zero removals is an honest idempotent reclaim pass.
+    Reclaimed(PruneReport),
+    RefusedExhausted { plan: MaintenancePlan, detail: String },
+    /// Partial progress, never relabeled a complete reclaim.
+    CleanupIncomplete(PruneReport),
+}
+impl PruneOutcome {
+    /// Preserve the full cleanup-debt report even when the pass was incomplete.
+    pub fn report(self) -> Result<PruneReport, NativeError> {
+        match self {
+            Self::Reclaimed(report) | Self::CleanupIncomplete(report) => Ok(report),
+            Self::RefusedExhausted { detail, .. } => Err(NativeError::MaintenanceRequired { detail }),
+        }
+    }
+}
+
 /// One maintenance pass: an explicit checkpoint followed by an explicit
 /// prune. Evidence (committed rows) is preserved across the pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaintenanceOutcome {
+pub struct MaintenanceReport {
     /// The checkpoint half of the pass.
     pub checkpoint: CheckpointReport,
     /// The prune half of the pass.
     pub prune: PruneReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceOutcome {
+    Completed(MaintenanceReport),
+    CleanupIncomplete(MaintenanceReport),
+    /// If checkpoint committed before prune refused, retain its selection.
+    RefusedExhausted {
+        checkpoint: Option<CheckpointReport>,
+        plan: MaintenancePlan,
+        detail: String,
+    },
+}
+impl MaintenanceOutcome {
+    pub fn report(self) -> Result<MaintenanceReport, NativeError> {
+        match self {
+            Self::Completed(report) | Self::CleanupIncomplete(report) => Ok(report),
+            Self::RefusedExhausted { detail, .. } => Err(NativeError::MaintenanceRequired { detail }),
+        }
+    }
 }
 
 /// Lowercase hex over a 32-byte digest (no helper crates on this side of

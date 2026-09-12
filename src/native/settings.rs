@@ -26,6 +26,10 @@ pub struct NativeBounds {
     pub max_store_bytes: u64,
     /// Maximum concurrent facade admissions per handle.
     pub max_inflight: u32,
+    /// Synthetic working-space allowance for native maintenance, not allocated space.
+    pub native_reserve_bytes: u64,
+    /// Keep this many bytes available in the maintenance plan for future WAL traffic.
+    pub future_journal_reserve_bytes: u64,
 }
 
 impl NativeBounds {
@@ -37,6 +41,8 @@ impl NativeBounds {
             max_statement_bytes: 16_384,
             max_store_bytes: 268_435_456,
             max_inflight: 8,
+            native_reserve_bytes: 1_048_576,
+            future_journal_reserve_bytes: 1_048_576,
         }
     }
 
@@ -68,7 +74,46 @@ impl NativeBounds {
                 "must be at least 1 (zero would refuse all work)".to_string(),
             ));
         }
+        if self.native_reserve_bytes == 0 || self.future_journal_reserve_bytes == 0 {
+            return Err(NativeError::invalid_input("maintenance_reserves", "both reserves must be positive"));
+        }
+        if self.native_reserve_bytes.checked_add(self.future_journal_reserve_bytes).is_none() {
+            return Err(NativeError::invalid_input("maintenance_reserves", "reserve sum overflows u64"));
+        }
         Ok(())
+    }
+
+    /// Exact synthetic plan: observed whole directory + working reserve + future WAL.
+    /// Equality admits. This is neither a filesystem reservation nor a bound on the
+    /// bytes a GQL statement/checkpoint will produce. An operator may configure a
+    /// valid but exhausted plan; validation never silently grows the capacity.
+    pub fn plan_maintenance(&self, store_bytes: u64) -> Result<MaintenancePlan, NativeError> {
+        self.validate()?;
+        let required_bytes = store_bytes.checked_add(self.native_reserve_bytes)
+            .and_then(|n| n.checked_add(self.future_journal_reserve_bytes));
+        Ok(MaintenancePlan {
+            store_bytes,
+            native_reserve_bytes: self.native_reserve_bytes,
+            future_journal_reserve_bytes: self.future_journal_reserve_bytes,
+            required_bytes,
+            max_bytes: self.max_store_bytes,
+        })
+    }
+}
+
+/// Disclosed planning numbers. `None` means mathematical overflow, never a
+/// saturated fake byte measurement. Plans govern checkpoint AND prune admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenancePlan {
+    pub store_bytes: u64,
+    pub native_reserve_bytes: u64,
+    pub future_journal_reserve_bytes: u64,
+    pub required_bytes: Option<u64>,
+    pub max_bytes: u64,
+}
+impl MaintenancePlan {
+    pub fn admitted(&self) -> bool {
+        matches!(self.required_bytes, Some(required) if required <= self.max_bytes)
     }
 }
 
@@ -101,8 +146,9 @@ impl std::fmt::Display for NativeSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max_statement_bytes={} max_store_bytes={} max_inflight={}",
-            self.bounds.max_statement_bytes, self.bounds.max_store_bytes, self.bounds.max_inflight
+            "max_statement_bytes={} max_store_bytes={} max_inflight={} native_reserve_bytes={} future_journal_reserve_bytes={}",
+            self.bounds.max_statement_bytes, self.bounds.max_store_bytes, self.bounds.max_inflight,
+            self.bounds.native_reserve_bytes, self.bounds.future_journal_reserve_bytes
         )
     }
 }

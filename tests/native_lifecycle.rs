@@ -13,10 +13,10 @@
 //! Verdant facade preserves committed state across its own close/reopen and
 //! maintenance boundaries.
 //!
-//! Determinism: no wall-clock assertions tighter than a 120 s completion
-//! budget on the concurrency test; everything else asserts exact values and
-//! stable machine codes.
-
+#[path = "../src/domain/mod.rs"]
+mod domain;
+#[path = "../src/storage/mod.rs"]
+mod storage;
 #[path = "../src/native/mod.rs"]
 mod native;
 
@@ -153,21 +153,21 @@ fn checkpoint_prune_maintain_through_single_facade() {
     let scratch = Scratch::new("maintain");
     let (handle, _) = create_with_rows(&scratch, "store", 4);
 
-    let checkpoint = handle.checkpoint().expect("checkpoint");
+    let checkpoint = handle.checkpoint().and_then(native::CheckpointOutcome::completed).expect("checkpoint");
     assert!(checkpoint.generation >= 1);
     assert!(checkpoint.bytes > 0);
     assert_eq!(checkpoint.digest_hex.len(), 64);
     assert!(!checkpoint.snapshot.is_empty());
     assert!(checkpoint.store_bytes_after > 0);
 
-    let prune = handle.prune().expect("prune");
+    let prune = handle.prune().and_then(native::PruneOutcome::report).expect("prune");
     assert!(prune.cleanup_error.is_none(), "no cleanup debt expected");
     assert!(
         !prune.retained.is_empty(),
         "CURRENT + previous checkpoint stay retained"
     );
 
-    let maintained = handle.maintain().expect("maintain");
+    let maintained = handle.maintain().and_then(native::MaintenanceOutcome::report).expect("maintain");
     assert!(maintained.checkpoint.generation >= checkpoint.generation);
     assert!(maintained.prune.cleanup_error.is_none());
     assert_eq!(count_rows(&handle), 4, "maintenance preserves evidence");
@@ -229,7 +229,7 @@ fn double_create_is_refused_never_overwritten() {
     // First owner is undisturbed: its row is still the only row.
     assert_eq!(count_rows(&handle), 1);
     let after = handle
-        .checkpoint()
+        .checkpoint().and_then(native::CheckpointOutcome::completed)
         .expect("first owner still checkpoints")
         .store_bytes_after;
     assert!(after >= before, "no second owner truncated the store");
@@ -263,13 +263,13 @@ fn close_reopen_preserves_committed_state_via_wal_replay() {
 fn maintenance_preserves_evidence_across_restart() {
     let scratch = Scratch::new("maintain-restart");
     let (handle, _) = create_with_rows(&scratch, "store", 6);
-    let outcome = handle.maintain().expect("maintain");
+    let outcome = handle.maintain().and_then(native::MaintenanceOutcome::report).expect("maintain");
     assert!(outcome.prune.cleanup_error.is_none());
     let closed = handle.close();
     let (reopened, _) = closed.open().expect("reopen");
     assert_eq!(count_rows(&reopened), 6);
     // Steady restart timing shape: a post-restart checkpoint still selects.
-    let again = reopened.checkpoint().expect("post-restart checkpoint");
+    let again = reopened.checkpoint().and_then(native::CheckpointOutcome::completed).expect("post-restart checkpoint");
     assert!(again.generation >= outcome.checkpoint.generation);
 }
 
@@ -311,7 +311,7 @@ fn over_budget_store_refused_before_promise() {
     };
     assert!(tiny.validate().is_ok());
     let err = NativeHandle::open(&dir, tiny).expect_err("tiny ceiling must refuse");
-    assert_eq!(err.code(), "resource-limit");
+    assert_eq!(err.code(), "maintenance-required");
     // Untouched: a normal open still sees both rows.
     let (handle, _) = NativeHandle::open(&dir, local_settings()).expect("normal reopen");
     assert_eq!(count_rows(&handle), 2);
@@ -381,7 +381,7 @@ fn checkpoint_does_not_stall_readers() {
     let budget = std::time::Duration::from_secs(120);
     std::thread::scope(|scope| {
         let worker = handle.clone();
-        let checkpoint = scope.spawn(move || worker.checkpoint());
+        let checkpoint = scope.spawn(move || worker.checkpoint().and_then(native::CheckpointOutcome::completed));
         // Admission path keeps serving reads while the checkpoint holds
         // Selene's serial write reservation (held reader views stay valid).
         let mut observed = 0usize;
@@ -486,7 +486,7 @@ fn data3_checkpoint_measure_failure_is_io_never_max() {
     // never 16 EiB (`u64::MAX`) presented as a measurement.
     let scratch = Scratch::new("data3-measure");
     let (handle, dir) = create_with_rows(&scratch, "store", 2);
-    let ok = handle.checkpoint().expect("baseline checkpoint");
+    let ok = handle.checkpoint().and_then(native::CheckpointOutcome::completed).expect("baseline checkpoint");
     assert_ne!(
         ok.store_bytes_after,
         u64::MAX,

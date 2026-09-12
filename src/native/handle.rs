@@ -51,6 +51,10 @@ use super::report::{
 use super::settings::NativeSettings;
 use super::{CHANNEL_IDENTITY, FORMAT_ID, SELENE_CRATE_VERSION, SELENE_REV};
 
+#[path = "maintenance.rs"]
+mod maintenance;
+use maintenance::CachedCheckpoint;
+
 /// Frozen synthetic lifecycle catalog layout (proven by the Selene facade
 /// doctests at the pinned rev; synthetic only, never field data).
 const LIFECYCLE_SCHEMA_CATALOG: &str = "selene";
@@ -123,6 +127,7 @@ struct Shared {
     settings: NativeSettings,
     graph: ObjectPath,
     gate: AdmissionGate,
+    checkpoint: Mutex<Option<CachedCheckpoint>>,
 }
 
 impl fmt::Debug for Shared {
@@ -172,6 +177,13 @@ impl NativeHandle {
         let gate = AdmissionGate::new(settings.bounds.max_inflight);
         let _admission = gate.try_enter()?;
         Self::check_dir_usable(dir)?;
+        let bytes = Self::measure_with_bounds(dir, settings)?;
+        let plan = settings.bounds.plan_maintenance(bytes)?;
+        if !plan.admitted() {
+            return Err(NativeError::MaintenanceRequired {
+                detail: format!("bootstrap plan exhausted: {plan:?}"),
+            });
+        }
         let db = Database::create(dir).map_err(|e| NativeError::from_storage_in(e, dir))?;
         let graph = Self::init_lifecycle(&db)?;
         let shared = Arc::new(Shared {
@@ -180,6 +192,7 @@ impl NativeHandle {
             settings,
             graph,
             gate: AdmissionGate::new(settings.bounds.max_inflight),
+            checkpoint: Mutex::new(None),
         });
         let handle = NativeHandle { shared };
         let report = handle.open_report(None)?;
@@ -197,6 +210,7 @@ impl NativeHandle {
         let gate = AdmissionGate::new(settings.bounds.max_inflight);
         let _admission = gate.try_enter()?;
         Self::check_dir_usable(dir)?;
+        Self::measure_with_bounds(dir, settings)?;
         let db = Database::open(dir).map_err(|e| NativeError::from_storage_in(e, dir))?;
         let graph = Self::lifecycle_graph()?;
         // Prove activation against the expected lifecycle graph before
@@ -208,6 +222,7 @@ impl NativeHandle {
             settings,
             graph,
             gate: AdmissionGate::new(settings.bounds.max_inflight),
+            checkpoint: Mutex::new(None),
         });
         let handle = NativeHandle { shared };
         let report = handle.open_report(recovery)?;
@@ -246,64 +261,6 @@ impl NativeHandle {
             row_count: outcome.row_count(),
             changes: outcome.write_summary().map(|s| s.change_count()),
         })
-    }
-
-    /// Hold the serial write reservation through full image encoding and
-    /// durable selection. Held reader views stay valid; foreground writes
-    /// wait inside Selene; facade admission stays narrow (clone outside the
-    /// lock). Never auto-prunes: call [`Self::prune`] explicitly.
-    pub fn checkpoint(&self) -> Result<CheckpointReport, NativeError> {
-        let _admission = self.shared.gate.try_enter()?;
-        self.check_store_ceiling()?;
-        let db = self.clone_db()?;
-        let outcome = db
-            .checkpoint()
-            .map_err(|e| NativeError::from_storage_in(e, &self.shared.dir))?;
-        // Post-selection footprint is a measurement, never a sentinel: a
-        // failed measure is a typed Io refusal (matching open_report and
-        // check_store_ceiling), never 16 EiB (`u64::MAX`).
-        let store_bytes_after =
-            measure_store_bytes(&self.shared.dir).map_err(|message| NativeError::Io {
-                path: self.shared.dir.display().to_string(),
-                message,
-            })?;
-        Ok(CheckpointReport {
-            generation: outcome.generation,
-            snapshot: outcome.snapshot.clone(),
-            bytes: outcome.bytes,
-            digest_hex: hex32(&outcome.digest),
-            store_bytes_after,
-        })
-    }
-
-    /// Explicitly reclaim obsolete durable artifacts. Retains CURRENT, one
-    /// previous completed checkpoint, all their dependencies and every
-    /// active lease. Validation/durability errors occur before any deletion.
-    pub fn prune(&self) -> Result<PruneReport, NativeError> {
-        let _admission = self.shared.gate.try_enter()?;
-        self.check_store_ceiling()?;
-        let db = self.clone_db()?;
-        let outcome = db
-            .prune()
-            .map_err(|e| NativeError::from_storage_in(e, &self.shared.dir))?;
-        Ok(PruneReport {
-            removed_count: outcome.removed.len(),
-            removed_bytes: outcome.removed.iter().map(|a| a.bytes).sum(),
-            retained: outcome
-                .retained
-                .iter()
-                .map(|a| (a.artifact.name.clone(), format!("{:?}", a.reason)))
-                .collect(),
-            cleanup_error: outcome.cleanup_error.map(|e| format!("{e:?}")),
-        })
-    }
-
-    /// One maintenance pass: checkpoint, then prune. Committed evidence is
-    /// preserved across the pass (asserted across restarts by tests).
-    pub fn maintain(&self) -> Result<MaintenanceOutcome, NativeError> {
-        let checkpoint = self.checkpoint()?;
-        let prune = self.prune()?;
-        Ok(MaintenanceOutcome { checkpoint, prune })
     }
 
     /// Readiness + native presence for this handle.
@@ -454,15 +411,19 @@ impl NativeHandle {
     }
 
     fn measure_or_refuse(&self) -> Result<u64, NativeError> {
-        let bytes = measure_store_bytes(&self.shared.dir).map_err(|e| NativeError::Io {
-            path: self.shared.dir.display().to_string(),
+        Self::measure_with_bounds(&self.shared.dir, self.shared.settings)
+    }
+
+    fn measure_with_bounds(dir: &Path, settings: NativeSettings) -> Result<u64, NativeError> {
+        let bytes = measure_store_bytes(dir).map_err(|e| NativeError::Io {
+            path: dir.display().to_string(),
             message: e,
         })?;
-        if bytes > self.shared.settings.bounds.max_store_bytes {
-            return Err(NativeError::ResourceLimit {
+        if bytes > settings.bounds.max_store_bytes {
+            return Err(NativeError::MaintenanceRequired {
                 detail: format!(
                     "store footprint is {bytes} bytes; maximum is {} (refused before promise)",
-                    self.shared.settings.bounds.max_store_bytes
+                    settings.bounds.max_store_bytes
                 ),
             });
         }
@@ -540,14 +501,22 @@ fn measure_store_bytes(dir: &Path) -> Result<u64, String> {
         let entries = std::fs::read_dir(&next).map_err(|e| format!("read_dir: {e}"))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
-            let kind = entry.file_type().map_err(|e| format!("file type: {e}"))?;
+            // readdir races with our own concurrent 0-byte probe create/remove.
+            // Skipping vanished entries changes no admission math (probes are
+            // 0 bytes); every other error still fails closed.
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("file type: {e}")),
+            };
             if kind.is_dir() {
                 stack.push(entry.path());
             } else if kind.is_file() {
-                let len = entry
-                    .metadata()
-                    .map_err(|e| format!("metadata: {e}"))?
-                    .len();
+                let len = match entry.metadata() {
+                    Ok(metadata) => metadata.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(format!("metadata: {e}")),
+                };
                 total = total.saturating_add(len);
             }
         }
