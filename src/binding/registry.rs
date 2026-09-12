@@ -14,13 +14,13 @@
 //! revocation-verification path (tests assert it).
 
 use super::error::BindingError;
-use super::findings::{capability_fingerprint, Finding};
+use super::findings::Finding;
 use super::proposal::{propose, BindingRole, Feedback, ProposedBinding};
 use super::records::{
     EndpointAddress, EndpointClass, EquipmentKind, EquipmentRecord, PointRecord, PropertyName,
     SourceRecord, SpaceRecord,
 };
-use super::{assert_schema_generation, insert_binding_row, pct_encode};
+use super::{assert_schema_generation, pct_encode};
 use crate::domain::ids::{BindingRevision, InstalledId};
 use crate::domain::scope::TrustedScope;
 use crate::domain::values::Unit;
@@ -60,7 +60,8 @@ pub const OP_FINDING_TEXT: &str = "binding-finding";
 pub struct BindingRegistry {
     pub(crate) store: SqliteStore,
     pub(crate) revision: BindingRevision,
-    pub(crate) next_seq: u64,
+    pub(crate) sequence: u64,
+    pub(crate) guard: String,
     pub(crate) equipment: BTreeMap<String, EquipmentRecord>,
     pub(crate) spaces: BTreeMap<String, SpaceRecord>,
     pub(crate) sources: BTreeMap<String, SourceRecord>,
@@ -89,7 +90,8 @@ impl BindingRegistry {
         let mut registry = BindingRegistry {
             store,
             revision: BindingRevision::PLACEHOLDER,
-            next_seq: 1,
+            sequence: 0,
+            guard: String::new(),
             equipment: BTreeMap::new(),
             spaces: BTreeMap::new(),
             sources: BTreeMap::new(),
@@ -150,6 +152,7 @@ impl BindingRegistry {
         label: &str,
         address: &str,
     ) -> Result<(), BindingError> {
+        self.replay()?;
         if self.equipment.contains_key(id)
             || self.spaces.contains_key(id)
             || self.sources.contains_key(id)
@@ -163,15 +166,14 @@ impl BindingRegistry {
         let record = EquipmentRecord::parse(id, kind, scope.clone(), label, address)?;
         let entity = record.id().clone();
         let descriptor = format!(
-            "v=1;kind=equipment;id={};ekind={};scope={};label={};address={}",
+            "v=2;kind=equipment;id={};ekind={};scope={};label={};address={}",
             pct_encode(record.id().as_str()),
             pct_encode(record.kind().as_str()),
             pct_encode(record.scope().as_str()),
             pct_encode(record.label()),
             pct_encode(record.address().as_str()),
         );
-        let seq = self.claim_seq();
-        insert_binding_row(&self.store, OP_EQUIPMENT_TEXT, &entity, &descriptor, seq)?;
+        self.write_record(OP_EQUIPMENT_TEXT, &entity, &descriptor)?;
         if self.retired_addrs.contains(record.address().as_str()) {
             self.reassessment.insert(id.to_string());
         }
@@ -187,6 +189,7 @@ impl BindingRegistry {
         scope: TrustedScope,
         label: &str,
     ) -> Result<(), BindingError> {
+        self.replay()?;
         if self.equipment.contains_key(id)
             || self.spaces.contains_key(id)
             || self.sources.contains_key(id)
@@ -199,13 +202,12 @@ impl BindingRegistry {
         let record = SpaceRecord::parse(id, scope.clone(), label)?;
         let entity = record.id().clone();
         let descriptor = format!(
-            "v=1;kind=space;id={};scope={};label={}",
+            "v=2;kind=space;id={};scope={};label={}",
             pct_encode(record.id().as_str()),
             pct_encode(record.scope().as_str()),
             pct_encode(record.label()),
         );
-        let seq = self.claim_seq();
-        insert_binding_row(&self.store, OP_SPACE_TEXT, &entity, &descriptor, seq)?;
+        self.write_record(OP_SPACE_TEXT, &entity, &descriptor)?;
         self.spaces.insert(id.to_string(), record);
         self.bump_revision();
         Ok(())
@@ -219,6 +221,7 @@ impl BindingRegistry {
         scope: TrustedScope,
         label: &str,
     ) -> Result<(), BindingError> {
+        self.replay()?;
         if self.equipment.contains_key(id)
             || self.spaces.contains_key(id)
             || self.sources.contains_key(id)
@@ -231,13 +234,12 @@ impl BindingRegistry {
         let record = SourceRecord::parse(id, scope.clone(), label)?;
         let entity = record.id().clone();
         let descriptor = format!(
-            "v=1;kind=source;id={};scope={};label={}",
+            "v=2;kind=source;id={};scope={};label={}",
             pct_encode(record.id().as_str()),
             pct_encode(record.scope().as_str()),
             pct_encode(record.label()),
         );
-        let seq = self.claim_seq();
-        insert_binding_row(&self.store, OP_SOURCE_TEXT, &entity, &descriptor, seq)?;
+        self.write_record(OP_SOURCE_TEXT, &entity, &descriptor)?;
         self.sources.insert(id.to_string(), record);
         self.bump_revision();
         Ok(())
@@ -253,6 +255,7 @@ impl BindingRegistry {
         unit_text: &str,
         endpoint_class: EndpointClass,
     ) -> Result<(), BindingError> {
+        self.replay()?;
         let key = format!("{equipment}:{property}");
         if self.points.contains_key(&key) {
             return Err(BindingError::DuplicateIdentity {
@@ -269,15 +272,14 @@ impl BindingRegistry {
         )?;
         let entity = record.equipment().clone();
         let descriptor = format!(
-            "v=1;kind=point;equipment={};property={};scope={};unit={};eclass={}",
+            "v=2;kind=point;equipment={};property={};scope={};unit={};eclass={}",
             pct_encode(record.equipment().as_str()),
             pct_encode(record.property().as_str()),
             pct_encode(record.scope().as_str()),
             pct_encode(record.unit().as_str()),
             pct_encode(record.endpoint_class().as_str()),
         );
-        let seq = self.claim_seq();
-        insert_binding_row(&self.store, OP_POINT_TEXT, &entity, &descriptor, seq)?;
+        self.write_record(OP_POINT_TEXT, &entity, &descriptor)?;
         self.points.insert(key, record);
         self.bump_revision();
         Ok(())
@@ -287,6 +289,7 @@ impl BindingRegistry {
     /// joins the reassessment set so a later record at the same address
     /// needs fresh qualification.
     pub fn retire(&mut self, id: &str, reason: &str) -> Result<(), BindingError> {
+        self.replay()?;
         let record = self
             .equipment
             .get(id)
@@ -307,20 +310,20 @@ impl BindingRegistry {
         let entity = record.id().clone();
         let address = record.address().as_str().to_string();
         let descriptor = format!(
-            "v=1;kind=retire;id={};address={};reason={}",
+            "v=2;kind=retire;id={};address={};reason={}",
             pct_encode(id),
             pct_encode(&address),
             pct_encode(reason),
         );
-        let seq = self.claim_seq();
-        insert_binding_row(&self.store, OP_RETIRE_TEXT, &entity, &descriptor, seq)?;
+        self.write_record(OP_RETIRE_TEXT, &entity, &descriptor)?;
         self.retired.insert(id.to_string());
         self.retired_addrs.insert(address);
         self.bump_revision();
         Ok(())
     }
 
-    /// Capability-gated proposal: structural checks plus PR04 entry.
+    /// New-operation convenience: structural checks plus live access entry.
+    /// For retryable work retain a `PendingProposal` and use `submit_proposal`.
     ///
     /// `Sense` requires `enter_review`; `Drive` requires `enter_publish`
     /// in the point scope. Cross-scope attempts are refused and grant
@@ -344,6 +347,7 @@ impl BindingRegistry {
         effective: BindingRole,
         feedback: Feedback,
     ) -> Result<ProposedBinding, BindingError> {
+        self.replay()?;
         let key = format!("{point_equipment}:{point_property}");
         let point = self
             .points
@@ -397,30 +401,10 @@ impl BindingRegistry {
             effective,
             feedback,
         )?;
-        Self::check_capability(gate, credential, &point_scope, requested)?;
-        let entity = binding.point_equipment().clone();
-        let mode_text = binding.mode().map(|m| m.as_str()).unwrap_or("-");
-        let descriptor = format!(
-            "v=1;kind=propose;endpoint={};eclass={};escope={};equipment={};property={};pscope={};source={};unit={};mode={};requested={};effective={};feedback={};status={}",
-            pct_encode(binding.endpoint().as_str()),
-            pct_encode(binding.endpoint_class().as_str()),
-            pct_encode(binding.endpoint_scope().as_str()),
-            pct_encode(binding.point_equipment().as_str()),
-            pct_encode(binding.point_property().as_str()),
-            pct_encode(binding.point_scope().as_str()),
-            pct_encode(binding.source().as_str()),
-            pct_encode(binding.unit().as_str()),
-            pct_encode(mode_text),
-            pct_encode(binding.requested().as_str()),
-            pct_encode(binding.effective().as_str()),
-            pct_encode(binding.feedback().as_str()),
-            pct_encode(binding.status().as_str()),
+        let pending = super::writer::PendingProposal::new(
+            super::writer::operation_id()?, self.revision, binding,
         );
-        let seq = self.claim_seq();
-        insert_binding_row(&self.store, OP_PROPOSE_TEXT, &entity, &descriptor, seq)?;
-        self.bindings.push(binding.clone());
-        self.bump_revision();
-        Ok(binding)
+        self.submit_proposal(gate, credential, &pending).map(|commit| commit.binding)
     }
 
     /// Capability-gated import of one PR06 conversion binding, anchored to
@@ -441,12 +425,15 @@ impl BindingRegistry {
     /// self-referential (both sides caller-controlled) and must never decide
     /// authorization. Success persists the imported binding (`imported`, not
     /// `valid`).
+    /// `input_revision` is the revision against which conversion inputs were
+    /// assembled; a cross-revision import is refused, never silently rebased.
     #[allow(clippy::too_many_arguments)]
     pub fn import_with_credential(
         &mut self,
         gate: &crate::access::AccessGate,
         credential: Option<&crate::access::Credential>,
         conversion: &crate::semantics::convert::Binding,
+        input_revision: BindingRevision,
         endpoint_address: &str,
         endpoint_class: EndpointClass,
         endpoint_scope: TrustedScope,
@@ -456,6 +443,8 @@ impl BindingRegistry {
         effective: BindingRole,
         feedback: Feedback,
     ) -> Result<ProposedBinding, BindingError> {
+        self.replay()?;
+        self.require_revision(input_revision)?;
         let verdant_id = conversion.verdant_id().as_str().to_string();
         let key = format!("{verdant_id}:{point_property}");
         let stored = self
@@ -494,102 +483,10 @@ impl BindingRegistry {
             effective,
             feedback,
         )?;
-        Self::check_capability(gate, credential, &point_scope, requested)?;
-        let entity = imported.point_equipment().clone();
-        let mode_text = imported.mode().map(|m| m.as_str()).unwrap_or("-");
-        let descriptor = format!(
-            "v=1;kind=propose;endpoint={};eclass={};escope={};equipment={};property={};pscope={};source={};unit={};mode={};requested={};effective={};feedback={};status={}",
-            pct_encode(imported.endpoint().as_str()),
-            pct_encode(imported.endpoint_class().as_str()),
-            pct_encode(imported.endpoint_scope().as_str()),
-            pct_encode(imported.point_equipment().as_str()),
-            pct_encode(imported.point_property().as_str()),
-            pct_encode(imported.point_scope().as_str()),
-            pct_encode(imported.source().as_str()),
-            pct_encode(imported.unit().as_str()),
-            pct_encode(mode_text),
-            pct_encode(imported.requested().as_str()),
-            pct_encode(imported.effective().as_str()),
-            pct_encode(imported.feedback().as_str()),
-            pct_encode(imported.status().as_str()),
+        let pending = super::writer::PendingProposal::new(
+            super::writer::operation_id()?, input_revision, imported,
         );
-        let seq = self.claim_seq();
-        insert_binding_row(&self.store, OP_PROPOSE_TEXT, &entity, &descriptor, seq)?;
-        self.bindings.push(imported.clone());
-        self.bump_revision();
-        Ok(imported)
-    }
-
-    /// Emit the stable prerequisite finding for `binding`, scoped to
-    /// `credential`. The `(id, generation)` pair is what PR11 seals cite.
-    pub fn emit_finding(
-        &mut self,
-        binding: &ProposedBinding,
-        credential: &crate::access::Credential,
-    ) -> Result<Finding, BindingError> {
-        let fp = capability_fingerprint(credential);
-        let finding = Finding::for_binding(binding, self.revision, &fp);
-        let entity = binding.point_equipment().clone();
-        let descriptor = format!(
-            "v=1;kind=finding;fid={};generation={};revision={};digest={};summary={};fp={};equipment={};property={}",
-            pct_encode(finding.id().as_str()),
-            finding.generation(),
-            finding.binding_revision().as_u32(),
-            pct_encode(finding.digest()),
-            pct_encode(finding.summary()),
-            pct_encode(finding.capability_fingerprint_text()),
-            pct_encode(binding.point_equipment().as_str()),
-            pct_encode(binding.point_property().as_str()),
-        );
-        let seq = self.claim_seq();
-        insert_binding_row(&self.store, OP_FINDING_TEXT, &entity, &descriptor, seq)?;
-        self.findings.push(finding.clone());
-        Ok(finding)
-    }
-
-    fn check_capability(
-        gate: &crate::access::AccessGate,
-        credential: Option<&crate::access::Credential>,
-        scope: &TrustedScope,
-        requested: BindingRole,
-    ) -> Result<(), BindingError> {
-        let entered = match requested {
-            BindingRole::Sense => gate.enter_review(credential, scope),
-            BindingRole::Drive => gate.enter_publish(credential, scope),
-        };
-        match entered {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let code = e.code().to_string();
-                let detail = e.to_string();
-                match e {
-                    crate::access::AccessError::ScopeDenied {
-                        expected,
-                        presented,
-                    } => Err(BindingError::ScopeDenied {
-                        expected,
-                        presented,
-                    }),
-                    crate::access::AccessError::CeilingExceeded { .. }
-                    | crate::access::AccessError::RoleDenied { .. } => {
-                        Err(BindingError::WrongRole {
-                            requested: requested.as_str().to_string(),
-                            detail: format!("capability cannot cover role: {detail} [{code}]"),
-                        })
-                    }
-                    _ => Err(BindingError::capability_denied(detail, &code)),
-                }
-            }
-        }
-    }
-
-    pub(crate) fn claim_seq(&mut self) -> u64 {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.saturating_add(1).max(1);
-        if self.next_seq == 1 {
-            self.next_seq = 2;
-        }
-        seq
+        self.submit_proposal(gate, credential, &pending).map(|commit| commit.binding)
     }
 
     pub(crate) fn bump_revision(&mut self) {

@@ -57,6 +57,12 @@ pub enum BindingError {
     /// Capability check failed (revoked, forged, stale, ceiling/role detail
     /// preserved in `detail`; PR04 code preserved in `access_code`).
     CapabilityDenied { detail: String, access_code: String },
+    /// A competing durable evolution or an operation/request mismatch won.
+    Conflict { detail: String },
+    /// Commit was not observed. Reconcile this identity; never create new work.
+    MutationUnknown { operation: crate::domain::ids::OperationId, detail: String },
+    /// No history is available in the requested observation window.
+    EmptyWindow,
     /// Wrapped PR03 storage failure (code preserved).
     Store(crate::storage::StorageError),
 }
@@ -79,6 +85,9 @@ impl BindingError {
             BindingError::ImportCollision { .. } => "import-collision",
             BindingError::ImportSlotMismatch { .. } => "import-slot-mismatch",
             BindingError::CapabilityDenied { .. } => "capability-denied",
+            BindingError::Conflict { .. } => "conflict",
+            BindingError::MutationUnknown { .. } => "mutation-unknown",
+            BindingError::EmptyWindow => "empty-window",
             BindingError::Store(inner) => inner.code(),
         }
     }
@@ -169,6 +178,9 @@ impl fmt::Display for BindingError {
                 access_code,
             } => write!(f, "capability denied [{access_code}]: {detail}"),
             BindingError::Store(inner) => write!(f, "{inner}"),
+            BindingError::Conflict { detail } => write!(f, "binding conflict: {detail}"),
+            BindingError::MutationUnknown { operation, detail } => write!(f, "binding outcome UNKNOWN for {}; reconcile this operation: {detail}", operation.as_str()),
+            BindingError::EmptyWindow => write!(f, "binding replay window is empty or expired"),
         }
     }
 }
