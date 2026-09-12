@@ -1,0 +1,5 @@
+# M01-PR01 frozen toolchain pin (acceptance record D02). No silent upgrades:
+# changing this file is an owner decision, not a build convenience.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"

@@ -1,0 +1,4 @@
+# Build output only. Owned-source manifests (Cargo.toml, Cargo.lock,
+# rust-toolchain.toml) stay tracked. Added in M01-PR01 to keep the
+# orchestrator's delivery diff free of build artifacts (owner may drop).
+/target

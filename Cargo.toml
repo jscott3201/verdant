@@ -1,0 +1,15 @@
+[package]
+name = "verdant"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+description = "Verdant local-first site telemetry — M01-PR01 runnable workspace and profile boundaries"
+publish = false
+
+# Single-crate workspace (owner-selected for M01-PR01). PR02–PR06 add
+# scoped modules under src/ via the integration owner; no empty crates.
+[workspace]
+
+[[bin]]
+name = "verdant"
+path = "src/main.rs"

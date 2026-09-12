@@ -1,0 +1,155 @@
+# M01-PR01 focused CI: product execution vs docs-only selection vs empty
+# tests vs setup failure are distinct outcomes (integration contract §6).
+#
+# - Setup failure  = toolchain install / checkout fails (its own step).
+# - Docs-only      = only *.md changed under the selection policy: product
+#                    steps are SKIPPED explicitly and must not claim tests ran.
+# - Empty tests    = cargo test executes zero tests: hard FAIL (green badge
+#                    alone is not evidence).
+# - Product        = build + full test run + evidence report + smoke run.
+# - Stops          = asserted from observed exits + `stopped` markers with
+#                    explicit codes; job-level timeout-minutes is an outer
+#                    failure bound, never a stop inference.
+#
+# Least privilege: contents:read. External actions should be SHA-pinned by
+# the integration owner at merge time (currently tag-pinned; see handoff).
+
+name: pr01
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pr01-checks:
+    # macos-14 is arm64 (Apple Silicon), matching the D02 macOS/arm64 family.
+    # The exact runner is recorded in the pins step; only the tested target
+    # is claimed, all others remain untested.
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (setup layer)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned toolchain (setup layer)
+        run: |
+          set -u
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup override set 1.97.1
+          rustc -V
+          cargo -V
+
+      - name: Classify selection (product vs docs-only)
+        id: classify
+        run: |
+          set -u
+          base=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            before="${{ github.event.before }}"
+            if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ]; then
+              base="$before"
+            fi
+          fi
+          if [ -z "$base" ]; then
+            echo "No baseline (first commit or manual run): selecting product execution."
+            echo "selection=product" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(git diff --name-only "$base"...HEAD 2>/dev/null || git diff --name-only "$base" HEAD)"
+          echo "Changed files vs $base:"
+          echo "$files"
+          if [ -z "$files" ]; then
+            echo "Empty change set: skipping product execution (NOT a product pass)."
+            echo "selection=no-changes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Docs-only selection policy: every changed path is Markdown.
+          non_docs="$(echo "$files" | grep -vE '\.md$' || true)"
+          if [ -z "$non_docs" ]; then
+            echo "Docs-only selection: product tests are SKIPPED and must not be claimed as run."
+            echo "selection=docs-only" >> "$GITHUB_OUTPUT"
+          else
+            echo "Product selection: executing build + tests."
+            echo "selection=product" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build — one supported target first (product execution)
+        if: steps.classify.outputs.selection == 'product'
+        run: |
+          set -u
+          cargo build --locked
+          echo "--- exact pins ---"
+          rustc -V
+          cargo -V
+          rustc -vV | grep host || true
+
+      - name: Test — full run, empty execution fails (product execution)
+        if: steps.classify.outputs.selection == 'product'
+        run: |
+          set -u -o pipefail
+          cargo test --locked 2>&1 | tee pr01-test.log
+          passed="$(grep -oE '[0-9]+ passed' pr01-test.log | awk '{s+=$1} END {print s+0}')"
+          echo "Executed passing tests (summed over suites): $passed"
+          if [ "$passed" -le 0 ]; then
+            echo "::error::empty tests: 0 tests executed — an empty run does NOT pass."
+            exit 3
+          fi
+
+      - name: Evidence report (product execution)
+        if: steps.classify.outputs.selection == 'product'
+        run: |
+          set -u
+          cargo run --locked -- evidence
+          echo "--- explicit evidence-completeness re-run (manifest visible) ---"
+          cargo test --locked evidence_completeness -- --nocapture
+
+      - name: Smoke — start/stop + refusals with explicit codes (product execution)
+        if: steps.classify.outputs.selection == 'product'
+        run: |
+          set -u
+          work="$(mktemp -d "${TMPDIR:-/tmp}/verdant-pr01-ci-XXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          mkdir -p "$work/durable"
+          bin="./target/debug/verdant"
+          printf 'role = "standalone"\ndurable_path = "%s/durable"\n' "$work" > "$work/ok.conf"
+          "$bin" health --config "$work/ok.conf" | tee "$work/health.log"
+          grep -q 'listener: none' "$work/health.log"
+          "$bin" run --config "$work/ok.conf" --once | tee "$work/run.log"
+          grep -q 'verdant starting role=standalone' "$work/run.log"
+          grep -q 'verdant stopped reason=once' "$work/run.log"
+          printf 'role = "nope"\ndurable_path = "%s/durable"\n' "$work" > "$work/bad.conf"
+          if "$bin" run --config "$work/bad.conf" --once 2>"$work/bad.log"; then
+            echo "::error::invalid role unexpectedly started"
+            exit 1
+          fi
+          grep -q '\[unknown-role\]' "$work/bad.log"
+          echo "smoke: explicit starts, stops and refusals all asserted by exit code + markers"
+
+      - name: Pins and environment inventory (report only)
+        if: always()
+        run: |
+          echo "--- compiler/toolchain ---"
+          rustc -V || true
+          cargo -V || true
+          echo "--- host ---"
+          uname -a || true
+          sw_vers || true
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.ncpu || true
+          sysctl -n hw.memsize || true
+          df -h . || true
+          echo "--- sqlite (system, NOT linked in PR01) ---"
+          sqlite3 --version || true
+          echo "--- selection ---"
+          echo "selection=${{ steps.classify.outputs.selection }}"
+          echo "--- tested source/tree (CI manifest; distinct from any later report commit) ---"
+          git rev-parse HEAD || echo "no commit (uncommitted worktree)"
+          git status --short --branch || true
