@@ -14,6 +14,9 @@
 //! [`convert::BindingSet`] revision semantics (bump on change, preserve on
 //! no-op) plus [`convert::SemanticsError`] unmapped-class diagnostics
 //! (`out-of-scenario` vs `unknown-class`, each naming class and profile).
+//!
+//! R07 vocabulary admission and the conversion/binding provenance seam are
+//! specified in `CONTRACT.md`. Conversion is not observed qualification.
 
 pub mod convert;
 pub mod profile;

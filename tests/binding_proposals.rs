@@ -35,6 +35,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+#[path = "semantics_cases/provenance.rs"]
+mod provenance;
+
 struct Scratch {
     dir: PathBuf,
 }
@@ -222,64 +225,7 @@ fn sense_and_drive_proposals_carry_explicit_unit_enum_and_roles() {
 
 #[test]
 fn imported_valid_and_observed_qualified_statuses_stay_separate() {
-    let scratch = Scratch::new("statuses");
-    let (gate, creds) = open_gate(&scratch, "stat.db");
-    let mut registry = open_registry(&scratch, "stat.db");
-    seed_tiny(&mut registry);
-    let valid = registry
-        .propose_with_credential(
-            &gate,
-            Some(&creds.publisher),
-            "mstp://ahu-1",
-            EndpointClass::Location,
-            scope_a(),
-            "ahu-1",
-            "supply-air-temp",
-            "sensor-sat-1",
-            unit("degC"),
-            None,
-            BindingRole::Sense,
-            BindingRole::Sense,
-            Feedback::Absent,
-        )
-        .expect("valid");
-    assert_eq!(valid.status(), BindingStatus::Valid);
-    assert!(!valid.status().is_observed_qualified());
-    // Imported via a PR06 conversion outcome (mapped only).
-    let profile = Profile::pinned();
-    let item = ExternalItem::parse(
-        "ext-ahu-1",
-        SUPPORTED_AHU_CLASS,
-        "ahu-1",
-        "AHU",
-        "degC",
-        Value::Decimal(domain::values::Decimal::parse("21.50").expect("decimal")),
-    )
-    .expect("external item");
-    let site = ExternalSite::new(vec![item]).expect("site");
-    let conversion = import_site(&site, &profile).expect("converts");
-    let imported_binding = conversion.bindings().first().expect("one binding");
-    let imported = binding::import_binding(
-        imported_binding,
-        "mstp://ahu-1",
-        EndpointClass::Location,
-        scope_a(),
-        "supply-air-temp",
-        scope_a(),
-        "sensor-sat-1",
-        &unit("degC"),
-        EndpointClass::Location,
-        BindingRole::Sense,
-        BindingRole::Sense,
-        Feedback::Absent,
-    )
-    .expect("import maps");
-    assert_eq!(imported.status(), BindingStatus::Imported);
-    assert!(!imported.status().is_observed_qualified());
-    // No static validation in this slice may claim sensing/actuation
-    // qualification: neither path yields observed-qualified.
-    assert_ne!(valid.status(), BindingStatus::ObservedQualified);
-    assert_ne!(imported.status(), BindingStatus::ObservedQualified);
+    provenance::assert_writer_separation_and_fidelity();
 }
 
 #[test]

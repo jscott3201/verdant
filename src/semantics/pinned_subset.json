@@ -17,7 +17,10 @@
   "profile": "verdant-pinned-brick-223p-rec-v1",
   "provenance": "offline curated synthetic subset for M01-PR06; not fetched from Brick, ASHRAE 223P or RealEstateCore; no network; covers only the tiny_site shape (AHU plus two VAVs plus shared supply-air temperature sensor); broader Brick, 223P and REC coverage is explicitly out of scope for v1",
   "revision": "BindingRevision bumps by one on an applied conversion that changes digests; preserved on no-op with identical profile plus input and content digests",
-  "scope": "tiny_site shape only: ahu-1 (AHU), vav-101 and vav-102 (VAV, duplicate label VAV), sensor-sat-1 (supply-air temperature sensor, shared scale degC); every other class is out-of-scenario or unknown",
+  "scope": "tiny_site shape vocabulary, not an installed-identity allowlist: ahu-1 (AHU), vav-101 and vav-102 (VAV, duplicate label VAV), sensor-sat-1 (supply-air temperature sensor, shared scale degC) are fixtures; matching slot prefixes such as ahu-9 convert but credentialed import requires recorded point truth; every other class is out-of-scenario or unknown",
+  "token_policy": "exact case-sensitive closed vocabularies; no case folding, synonyms, unit conversion or label inference; PR02 preserves unknown units and modes but this converter refuses them as invalid-input naming the token and profile",
+  "supported_units": ["degC", "percent", "Pa", "L/s"],
+  "supported_modes": ["occupied", "unoccupied", "standby"],
   "supported": [
     {
       "curated_class": "brick:AHU",
