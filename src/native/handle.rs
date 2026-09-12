@@ -172,7 +172,7 @@ impl NativeHandle {
         let gate = AdmissionGate::new(settings.bounds.max_inflight);
         let _admission = gate.try_enter()?;
         Self::check_dir_usable(dir)?;
-        let db = Database::create(dir).map_err(NativeError::from_storage)?;
+        let db = Database::create(dir).map_err(|e| NativeError::from_storage_in(e, dir))?;
         let graph = Self::init_lifecycle(&db)?;
         let shared = Arc::new(Shared {
             db: Mutex::new(db),
@@ -197,7 +197,7 @@ impl NativeHandle {
         let gate = AdmissionGate::new(settings.bounds.max_inflight);
         let _admission = gate.try_enter()?;
         Self::check_dir_usable(dir)?;
-        let db = Database::open(dir).map_err(NativeError::from_storage)?;
+        let db = Database::open(dir).map_err(|e| NativeError::from_storage_in(e, dir))?;
         let graph = Self::lifecycle_graph()?;
         // Prove activation against the expected lifecycle graph before
         // reporting readiness: a store without it is not our lifecycle.
@@ -256,13 +256,23 @@ impl NativeHandle {
         let _admission = self.shared.gate.try_enter()?;
         self.check_store_ceiling()?;
         let db = self.clone_db()?;
-        let outcome = db.checkpoint().map_err(NativeError::from_storage)?;
+        let outcome = db
+            .checkpoint()
+            .map_err(|e| NativeError::from_storage_in(e, &self.shared.dir))?;
+        // Post-selection footprint is a measurement, never a sentinel: a
+        // failed measure is a typed Io refusal (matching open_report and
+        // check_store_ceiling), never 16 EiB (`u64::MAX`).
+        let store_bytes_after =
+            measure_store_bytes(&self.shared.dir).map_err(|message| NativeError::Io {
+                path: self.shared.dir.display().to_string(),
+                message,
+            })?;
         Ok(CheckpointReport {
             generation: outcome.generation,
             snapshot: outcome.snapshot.clone(),
             bytes: outcome.bytes,
             digest_hex: hex32(&outcome.digest),
-            store_bytes_after: measure_store_bytes(&self.shared.dir).unwrap_or(u64::MAX),
+            store_bytes_after,
         })
     }
 
@@ -273,7 +283,9 @@ impl NativeHandle {
         let _admission = self.shared.gate.try_enter()?;
         self.check_store_ceiling()?;
         let db = self.clone_db()?;
-        let outcome = db.prune().map_err(NativeError::from_storage)?;
+        let outcome = db
+            .prune()
+            .map_err(|e| NativeError::from_storage_in(e, &self.shared.dir))?;
         Ok(PruneReport {
             removed_count: outcome.removed.len(),
             removed_bytes: outcome.removed.iter().map(|a| a.bytes).sum(),
@@ -407,9 +419,12 @@ impl NativeHandle {
             }
         })?;
         // Activation proof: resolve the lifecycle graph before reporting.
+        // A foreign-but-valid format-2 store without it is quarantine-class
+        // (Integrity), never statement-rejected: reserve StatementRejected
+        // for execute()-time outcomes.
         let db = self.clone_db()?;
         db.session(&self.shared.graph)
-            .map_err(NativeError::from_statement)?;
+            .map_err(NativeError::from_activation)?;
         Ok(OpenReport {
             dir: self.shared.dir.display().to_string(),
             format_id: FORMAT_ID,
@@ -500,11 +515,11 @@ impl NativeHandle {
             })?;
         db.catalog()
             .create_schema(&schema, CreatePolicy::Strict)
-            .map_err(NativeError::from_statement)?;
+            .map_err(NativeError::from_activation)?;
         let graph = Self::lifecycle_graph()?;
         db.catalog()
             .create_graph(&graph, None, CreatePolicy::Strict)
-            .map_err(NativeError::from_statement)?;
+            .map_err(NativeError::from_activation)?;
         Ok(graph)
     }
 }

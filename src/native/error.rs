@@ -25,9 +25,13 @@ pub enum NativeError {
     Compatibility { detail: String },
     /// Strict create found an existing initialized store (or unpublished
     /// bootstrap artifacts). Never overwrites, never adopts foreign files.
-    AlreadyInitialized { dir: String },
+    /// `dir` is the facade-supplied store path (reopen/retry authority);
+    /// `detail` carries the Selene diagnostic.
+    AlreadyInitialized { dir: String, detail: String },
     /// Open found no initialized format-2 store at the directory.
-    NotInitialized { dir: String },
+    /// `dir` is the facade-supplied store path; `detail` carries the Selene
+    /// diagnostic.
+    NotInitialized { dir: String, detail: String },
     /// Another owning database/session retains the store lock.
     Contention { detail: String },
     /// The facade admission gate is saturated (`max_inflight` reached). The
@@ -94,19 +98,27 @@ impl NativeError {
     /// Version/identity refusals keep their dedicated variants so tests can
     /// assert refusal-before-activation precisely; anything unmapped stays a
     /// [`NativeError::Lifecycle`] with its Selene phase/kind names attached.
-    pub fn from_storage(err: selene_db::StorageError) -> NativeError {
+    ///
+    /// `dir` is the facade-supplied store path and is recorded verbatim on
+    /// [`NativeError::AlreadyInitialized`]/[`NativeError::NotInitialized`] so
+    /// the path field stays a path (reopen/retry authority for M01-PR08+);
+    /// the Selene Display diagnostic is preserved in `detail`, never in `dir`.
+    pub fn from_storage_in(err: selene_db::StorageError, dir: &std::path::Path) -> NativeError {
         use selene_db::StorageErrorKind as K;
         let phase = format!("{:?}", err.phase);
         let kind_name = format!("{:?}", err.kind);
         let detail = format!("{err}");
+        let dir_string = dir.display().to_string();
         match err.kind {
             K::UnsupportedFormat => NativeError::UnsupportedFormat { detail },
             K::Compatibility => NativeError::Compatibility { detail },
             K::AlreadyInitialized => NativeError::AlreadyInitialized {
-                dir: detail.clone(),
+                dir: dir_string,
+                detail,
             },
             K::NotInitialized => NativeError::NotInitialized {
-                dir: detail.clone(),
+                dir: dir_string,
+                detail,
             },
             K::Contention => NativeError::Contention { detail },
             K::ResourceLimit => NativeError::ResourceLimit { detail },
@@ -143,9 +155,27 @@ impl NativeError {
     }
 
     /// Map one Selene GQL statement failure onto [`NativeError::StatementRejected`].
+    ///
+    /// Reserved for `execute()`-time outcomes only. Activation-proof session
+    /// failures and `init_lifecycle` catalog-Strict failures must use
+    /// [`NativeError::from_activation`] so "not our lifecycle, quarantine" is
+    /// never conflated with "bad statement, retry".
     pub fn from_statement(err: selene_db::Error) -> NativeError {
         NativeError::StatementRejected {
             detail: format!("{err}"),
+        }
+    }
+
+    /// Map an activation-proof or lifecycle-bootstrap failure onto
+    /// [`NativeError::Integrity`] with the Selene diagnostic attached.
+    ///
+    /// Used for the `open` activation proof (`session` on the expected
+    /// `selene/memory/data` graph) and for `init_lifecycle` catalog-Strict
+    /// failures. A foreign-but-valid format-2 store without the lifecycle
+    /// graph is quarantine-class, never statement-rejected.
+    pub fn from_activation(err: selene_db::Error) -> NativeError {
+        NativeError::Integrity {
+            detail: format!("lifecycle activation failed (not our lifecycle, quarantine): {err}"),
         }
     }
 }
@@ -168,16 +198,16 @@ impl fmt::Display for NativeError {
                     "native store identity mismatch (refused, never migrated): {detail}"
                 )
             }
-            NativeError::AlreadyInitialized { dir } => {
+            NativeError::AlreadyInitialized { dir, detail } => {
                 write!(
                     f,
-                    "native store already initialized (refusing to overwrite): {dir}"
+                    "native store already initialized (refusing to overwrite): {dir} ({detail})"
                 )
             }
-            NativeError::NotInitialized { dir } => {
+            NativeError::NotInitialized { dir, detail } => {
                 write!(
                     f,
-                    "no initialized native store (refusing to invent one): {dir}"
+                    "no initialized native store (refusing to invent one): {dir} ({detail})"
                 )
             }
             NativeError::Contention { detail } => {

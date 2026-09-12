@@ -400,3 +400,119 @@ fn checkpoint_does_not_stall_readers() {
         "bounded blocking work completes inside the stated budget"
     );
 }
+
+#[test]
+fn data1_not_initialized_dir_is_store_path() {
+    // DATA-1: `dir` must stay a path (reopen/retry authority for M01-PR08+),
+    // never the Selene Display diagnostic ("Select NotInitialized ...").
+    let scratch = Scratch::new("data1-not-init");
+    let dir = scratch.store("empty");
+    let err = NativeHandle::open(&dir, local_settings()).expect_err("empty dir is not a store");
+    assert_eq!(err.code(), "not-initialized");
+    match err {
+        NativeError::NotInitialized { dir: got, detail } => {
+            assert_eq!(
+                got,
+                dir.display().to_string(),
+                "dir carries the actual store path"
+            );
+            assert!(
+                detail.contains("NotInitialized"),
+                "Selene diagnostic preserved in detail, not dir: {detail}"
+            );
+        }
+        other => panic!("expected not-initialized, got {other:?}"),
+    }
+}
+
+#[test]
+fn data1_already_initialized_dir_is_store_path() {
+    // DATA-1: strict create on an existing CURRENT selection refuses with
+    // already-initialized whose `dir` is the actual store path. A CURRENT-only
+    // dir deterministically yields AlreadyInitialized at the pin (verified:
+    // `EmptyStoreControl::create_empty` returns AlreadyInitialized when CURRENT
+    // exists and the legacy probe sees no candidate).
+    let scratch = Scratch::new("data1-already-init");
+    let dir = scratch.store("exists");
+    std::fs::write(dir.join("CURRENT"), b"placeholder").expect("CURRENT placeholder");
+    let err = NativeHandle::create(&dir, local_settings()).expect_err("second create must refuse");
+    assert_eq!(err.code(), "already-initialized");
+    match err {
+        NativeError::AlreadyInitialized { dir: got, detail } => {
+            assert_eq!(
+                got,
+                dir.display().to_string(),
+                "dir carries the actual store path"
+            );
+            assert!(
+                detail.contains("AlreadyInitialized"),
+                "Selene diagnostic preserved in detail, not dir: {detail}"
+            );
+        }
+        other => panic!("expected already-initialized, got {other:?}"),
+    }
+}
+
+#[test]
+fn data2_foreign_store_without_lifecycle_is_integrity() {
+    // DATA-2: a foreign-but-valid format-2 store (raw Selene create without
+    // the `selene/memory/data` lifecycle graph) must refuse open as
+    // integrity-class (quarantine), never statement-rejected (retry).
+    let scratch = Scratch::new("data2-foreign");
+    let dir = scratch.store("foreign");
+    let raw = selene_db::Database::create(&dir).expect("raw Selene create");
+    drop(raw);
+    let err =
+        NativeHandle::open(&dir, local_settings()).expect_err("foreign store must not activate");
+    assert_eq!(
+        err.code(),
+        "integrity",
+        "quarantine, not statement-rejected"
+    );
+    match err {
+        NativeError::Integrity { detail } => {
+            assert!(
+                detail.contains("selene/memory") || detail.contains("does not exist"),
+                "Selene activation diagnostic attached: {detail}"
+            );
+        }
+        other => panic!("expected integrity, got {other:?}"),
+    }
+}
+
+#[test]
+fn data3_checkpoint_measure_failure_is_io_never_max() {
+    // DATA-3: a failed post-selection footprint measure is a typed Io refusal,
+    // never 16 EiB (`u64::MAX`) presented as a measurement.
+    let scratch = Scratch::new("data3-measure");
+    let (handle, dir) = create_with_rows(&scratch, "store", 2);
+    let ok = handle.checkpoint().expect("baseline checkpoint");
+    assert_ne!(
+        ok.store_bytes_after,
+        u64::MAX,
+        "successful measure never presents the sentinel"
+    );
+    assert!(
+        ok.store_bytes_after > 0 && ok.store_bytes_after < 1_073_741_824,
+        "footprint is a real measurement: {}",
+        ok.store_bytes_after
+    );
+    // Deterministic measure failure on APFS temp dirs: remove the store dir.
+    // Both the pre-ceiling and the post-selection measures refuse with Io;
+    // the regression is that neither path returns success with MAX.
+    std::fs::remove_dir_all(&dir).expect("remove store dir");
+    let err = handle
+        .checkpoint()
+        .expect_err("measure failure must refuse");
+    assert_eq!(err.code(), "io");
+    match err {
+        NativeError::Io { path, message } => {
+            assert_eq!(path, dir.display().to_string());
+            assert!(
+                message.contains("read_dir") || message.contains("No such file"),
+                "measure failure diagnostic: {message}"
+            );
+        }
+        other => panic!("expected io, got {other:?}"),
+    }
+}
