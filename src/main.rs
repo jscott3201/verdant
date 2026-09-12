@@ -14,6 +14,10 @@ mod domain;
 // Wiring only: the CLI surface is unchanged in this slice.
 #[allow(dead_code)]
 mod storage;
+// M01-PR04 named capability ceilings and direct-entry access.
+// Wiring only: the CLI surface is unchanged in this slice.
+#[allow(dead_code)]
+mod access;
 
 use config::{load_from_path, Role};
 use std::env;
