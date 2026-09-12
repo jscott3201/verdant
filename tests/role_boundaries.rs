@@ -419,7 +419,8 @@ fn version_and_health_report_build_inventory() {
         "rustc: ",
         "target: ",
         "profile: ",
-        "dependencies: none",
+        "dependencies: selene-db 2.0.0-alpha.1",
+        "b65c2344",
         "features: none",
         "native libraries linked: none",
     ] {
@@ -439,7 +440,9 @@ fn version_and_health_report_build_inventory() {
         "field_capability: absent",
         "listener: none",
         "stores: not-implemented",
-        "selene_native: not-bundled",
+        "selene_native: bundled",
+        "dependencies: selene-db 2.0.0-alpha.1",
+        "b65c2344",
         "sqlite_linked: no",
     ] {
         assert!(out.contains(fragment), "health missing '{fragment}': {out}");

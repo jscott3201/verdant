@@ -113,7 +113,11 @@ fn cmd_version(args: &[String]) -> ExitCode {
         println!("target: {BUILD_TARGET}");
         println!("profile: {}", profile());
         println!("edition: 2021");
-        println!("dependencies: none (std-only; no source downloads beyond the pinned toolchain)");
+        // Compiled-in inventory fact (Cargo.toml direct dep + Cargo.lock pin via
+        // the recorded native constants); never shelled out at runtime.
+        let dep = crate::native::presence();
+        let dep_rev_short = dep.rev.get(..8).unwrap_or(dep.rev);
+        println!("dependencies: {} {} (git rev {dep_rev_short}; default features; system sqlite3 3.54.0 via std::process, not linked)", dep.facade, dep.crate_version);
         println!("features: none");
         println!("native libraries linked: none (system sqlite3 is present but NOT linked in PR01)");
     }
@@ -153,6 +157,9 @@ fn cmd_health(args: &[String]) -> ExitCode {
         }
     };
     // Static build inventory first: true even when no config is supplied.
+    // Native identity is the compiled-in pin (same constants as version); no runtime shell-out.
+    let native = crate::native::presence();
+    let native_rev_short = native.rev.get(..8).unwrap_or(native.rev);
     println!("verdant health {}", if opts.config.is_some() { "checked" } else { "ok" });
     println!("version: {VERSION}");
     println!("rustc: {RUSTC_VERSION}");
@@ -161,10 +168,10 @@ fn cmd_health(args: &[String]) -> ExitCode {
     println!("field_capability: absent (no field listener in PR01; native engine deferred to M01-PR05)");
     println!("listener: none (local-only; PR01 binds no socket)");
     println!("stores: not-implemented (durable stores owned by M01-PR03)");
-    println!("selene_native: not-bundled (report only; lifecycle owned by M01-PR05)");
+    println!("selene_native: bundled ({} {} git rev {native_rev_short}; lifecycle owned by M01-PR05)", native.facade, native.crate_version);
     println!("sqlite_linked: no (system sqlite3 present, not linked in PR01)");
     if opts.verbose {
-        println!("dependencies: none (std-only)");
+        println!("dependencies: {} {} (git rev {native_rev_short}; default features)", native.facade, native.crate_version);
         println!("features: none");
         println!("native libraries linked: none");
     }
