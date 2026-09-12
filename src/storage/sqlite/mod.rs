@@ -200,10 +200,13 @@ struct Inner {
     last_checkpoint_epoch_secs: AtomicU64,
 }
 
-/// Tiny SQLite outbox handle. `Clone` shares one budget family; every method
-/// call spawns short-lived `sqlite3` connections (never a held-open writer),
-/// so handles are `Send + Sync` and concurrent writers serialize in SQLite.
-#[derive(Debug, Clone)]
+/// Tiny SQLite outbox handle. `try_clone` is the sole handle-creation path
+/// within a budget family (there is deliberately no `Clone` impl so derived
+/// clones cannot bypass the `max_connections` budget or corrupt the `handles`
+/// counter); every method call spawns short-lived `sqlite3` connections
+/// (never a held-open writer), so handles are `Send + Sync` and concurrent
+/// writers serialize in SQLite.
+#[derive(Debug)]
 pub struct SqliteStore {
     inner: Arc<Inner>,
 }
@@ -399,9 +402,15 @@ impl SqliteStore {
                 ),
             });
         }
+        validate_unit(unit)?;
         self.check_generation()?;
+        // One envelope, one transaction: BEGIN IMMEDIATE ... COMMIT with
+        // `.bail on` (see run_script_stdin) so a failing second statement or
+        // a SIGKILL before COMMIT rolls the whole insert back instead of
+        // leaving a committed outbox row with no dirty mark. The
+        // last_insert_rowid read sits inside the same transaction.
         let body = format!(
-            "INSERT INTO outbox(operation, entity, sensor, value_json, unit, source_ms, receipt_ms, ingestion_ms, generation, seq, status, claimed_by, created_nanos) VALUES ({op}, {entity}, {sensor}, {value}, {unit}, {source}, {receipt}, {ingestion}, {generation}, {seq}, 'queued', NULL, {now}); SELECT last_insert_rowid(); INSERT INTO derived_marks(entity, dirty, checked_generation) VALUES ({entity}, 1, 0) ON CONFLICT(entity) DO UPDATE SET dirty = 1; SELECT changes();",
+            "BEGIN IMMEDIATE; INSERT INTO outbox(operation, entity, sensor, value_json, unit, source_ms, receipt_ms, ingestion_ms, generation, seq, status, claimed_by, created_nanos) VALUES ({op}, {entity}, {sensor}, {value}, {unit}, {source}, {receipt}, {ingestion}, {generation}, {seq}, 'queued', NULL, {now}); SELECT last_insert_rowid(); INSERT INTO derived_marks(entity, dirty, checked_generation) VALUES ({entity}, 1, 0) ON CONFLICT(entity) DO UPDATE SET dirty = 1; SELECT changes(); COMMIT;",
             op = sql_quote(operation.as_str()),
             entity = sql_quote(entity.as_str()),
             sensor = sql_quote(sensor.as_str()),
@@ -1142,7 +1151,58 @@ fn validate_token(raw: &str) -> Result<String, StorageError> {
             detail: format!("token is {} chars; maximum is 128", raw.len()),
         });
     }
+    if let Some(reason) = envelope_framing_refusal(raw) {
+        return Err(StorageError::InvalidInput {
+            what: "claim token",
+            detail: reason,
+        });
+    }
     Ok(raw.to_string())
+}
+
+/// Storage-side envelope-framing guard (the CLI envelope splits
+/// `stdout.lines()` on `\n`/`\r` and columns on `0x1F` with no escaping, so a
+/// stored `unit` or `token` containing those bytes — or exactly equal to an
+/// envelope sentinel — would poison its whole page at decode time). Domain
+/// `Unit::parse` semantics are untouched (PR02-frozen); this is a
+/// storage-side refusal only.
+fn envelope_framing_refusal(raw: &str) -> Option<String> {
+    if raw.contains(COL_SEP) {
+        return Some(
+            "value contains the envelope column separator (0x1F); refused to preserve page framing"
+                .to_string(),
+        );
+    }
+    if raw.contains('\n') {
+        return Some(
+            "value contains a line feed (0x0A); refused to preserve page framing".to_string(),
+        );
+    }
+    if raw.contains('\r') {
+        return Some(
+            "value contains a carriage return (0x0D); refused to preserve page framing".to_string(),
+        );
+    }
+    if raw == SENT_BEGIN || raw == SENT_DATA || raw == SENT_END {
+        return Some(
+            "value equals an envelope sentinel (VERDANT_BEGIN/DATA/END); refused to preserve page framing"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Storage-side unit guard for [`SqliteStore::insert`]: refuses envelope
+/// framing bytes (and sentinel equality) with a typed refusal. Never alters
+/// `Unit::parse` semantics.
+fn validate_unit(unit: &Unit) -> Result<(), StorageError> {
+    if let Some(reason) = envelope_framing_refusal(unit.as_str()) {
+        return Err(StorageError::InvalidInput {
+            what: "unit",
+            detail: reason,
+        });
+    }
+    Ok(())
 }
 
 fn sqlite_version() -> Result<String, StorageError> {

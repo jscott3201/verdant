@@ -882,6 +882,13 @@ fn handoff_full_is_a_refusal_not_a_drop() {
 
 #[test]
 fn in_process_handle_budget_is_enforced() {
+    // Invariant: `try_clone` is the sole handle-creation path. `SqliteStore`
+    // deliberately has no `Clone` impl: a derived `Clone` would share the
+    // `Arc<Inner>` without incrementing `handles` while `Drop` always
+    // decrements, underflowing the counter to `u32::MAX` and permanently
+    // refusing legitimate `try_clone` calls. These drop cycles pin the
+    // counter integrity: after every release the budget must recover exactly,
+    // never stick at refused.
     let scratch = Scratch::new("budget");
     let mut bounds = StoreBounds::tiny();
     bounds.max_connections = 2;
@@ -898,7 +905,26 @@ fn in_process_handle_budget_is_enforced() {
         "too-many-connections"
     );
     drop(extra);
+    let recovered = store.try_clone().expect("slot released on drop");
+    drop(recovered);
+    for _ in 0..5 {
+        let handle = store
+            .try_clone()
+            .expect("budget recovers after each drop cycle (no counter underflow)");
+        drop(handle);
+    }
+    // Counter never underflowed to u32::MAX: a fresh clone still fits, the
+    // next still refuses, and the survivor still serves reads.
+    let extra = store
+        .try_clone()
+        .expect("slot still available after drop cycles");
+    assert_eq!(
+        store.try_clone().unwrap_err().code(),
+        "too-many-connections"
+    );
+    drop(extra);
     store.try_clone().expect("slot released on drop");
+    store.report().expect("surviving handle still serves reads");
 }
 
 #[test]
@@ -983,6 +1009,157 @@ fn invalid_inputs_are_refused_with_codes() {
         store.exec_script("   ").unwrap_err().code(),
         "invalid-input"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Envelope framing: storage-side refusal of 0x1F/0x0A/0x0D + sentinels.
+// Domain `Unit::parse` semantics are PR02-frozen (still accepts these labels
+// as unknown units); the store refuses them at the insert/token boundary so
+// one row can never poison its whole page at decode time.
+// ---------------------------------------------------------------------------
+
+fn insert_with_unit(
+    store: &SqliteStore,
+    op: &str,
+    unit: &Unit,
+    seq: u64,
+) -> Result<i64, storage::StorageError> {
+    store.insert(
+        &OperationId::parse(op).expect("op"),
+        &InstalledId::parse("ahu-1").expect("entity"),
+        &InstalledId::parse("sensor-sat-1").expect("sensor"),
+        &Value::Decimal(Decimal::parse("21.50").expect("decimal")),
+        unit,
+        triple(),
+        &record(seq),
+    )
+}
+
+fn assert_unit_refused(store: &SqliteStore, label: &str, op: &str, seq: u64) {
+    // Domain still preserves the label (PR02-frozen); the store refuses it.
+    let unit = Unit::parse(label).expect("domain preserves unknown unit labels");
+    match insert_with_unit(store, op, &unit, seq) {
+        Err(storage::StorageError::InvalidInput { what, .. }) => {
+            assert_eq!(what, "unit", "framing refusal is typed to the unit path");
+        }
+        other => panic!("poison unit {op} must be refused with invalid-input, got {other:?}"),
+    }
+}
+
+#[test]
+fn envelope_framing_poison_unit_is_refused() {
+    let scratch = Scratch::new("framing-unit");
+    let store = open_tiny(&scratch, "tiny.db");
+    assert_unit_refused(&store, "a\x1fb", "op-sep", 1);
+    assert_unit_refused(&store, "a\nb", "op-lf", 2);
+    assert_unit_refused(&store, "a\rb", "op-cr", 3);
+    for sentinel in ["VERDANT_BEGIN", "VERDANT_DATA", "VERDANT_END"] {
+        assert_unit_refused(&store, sentinel, &format!("op-{sentinel}"), 10);
+    }
+    // Nothing was written: every refusal happened before any write.
+    assert_eq!(
+        store.report().expect("report").queued,
+        0,
+        "refused poison units leave no rows"
+    );
+}
+
+#[test]
+fn envelope_framing_poison_token_is_refused() {
+    let scratch = Scratch::new("framing-token");
+    let store = open_tiny(&scratch, "tiny.db");
+    insert_fixture_row(&store, "op-1", 1);
+    for poison in [
+        "a\x1fb".to_string(),
+        "a\nb".to_string(),
+        "a\rb".to_string(),
+        "VERDANT_BEGIN".to_string(),
+        "VERDANT_DATA".to_string(),
+        "VERDANT_END".to_string(),
+    ] {
+        assert_eq!(
+            store.claim_queued(5, &poison).unwrap_err().code(),
+            "invalid-input",
+            "poison claim token must be refused"
+        );
+        assert_eq!(
+            store.acknowledge(1, &poison).unwrap_err().code(),
+            "invalid-input",
+            "poison acknowledge token must be refused"
+        );
+        assert_eq!(
+            store.requeue_claim(1, &poison).unwrap_err().code(),
+            "invalid-input",
+            "poison requeue token must be refused"
+        );
+    }
+    // The queued row is untouched and still claimable under a clean token.
+    assert_eq!(store.report().expect("report").queued, 1);
+    let claimed = store
+        .claim_queued(5, &token("framing-token", 0))
+        .expect("clean token still claims");
+    assert_eq!(claimed.len(), 1);
+}
+
+#[test]
+fn envelope_framing_refusal_preserves_neighbor_rows() {
+    let scratch = Scratch::new("framing-neighbors");
+    let store = open_tiny(&scratch, "tiny.db");
+    insert_fixture_row(&store, "op-1", 1);
+    insert_fixture_row(&store, "op-2", 2);
+    // Poison attempts are refused; legitimate rows on the same page stay readable.
+    assert_unit_refused(&store, "a\x1fb", "op-poison", 3);
+    assert_eq!(
+        store.claim_queued(5, "bad\x1ftoken").unwrap_err().code(),
+        "invalid-input"
+    );
+    let page = store.replay_queued(10).expect("neighbors still decode");
+    assert_eq!(page.served, 2, "no whole-page poisoning");
+    assert_eq!(page.rows[0].operation.as_str(), "op-1");
+    assert_eq!(page.rows[1].operation.as_str(), "op-2");
+    // Claims, reports, and dangling scans all still decode the same page.
+    let tok = token("framing-neighbors", 0);
+    let claimed = store.claim_queued(10, &tok).expect("claim neighbors");
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(store.report().expect("report").claimed, 2);
+    assert_eq!(store.dangling_claims().expect("dangling").len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Insert atomicity: outbox row + derived mark commit together or not at all.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn insert_is_atomic_when_derived_mark_write_fails() {
+    let scratch = Scratch::new("insert-atomic");
+    let store = open_tiny(&scratch, "tiny.db");
+    insert_fixture_row(&store, "op-good", 1);
+    // Force the second statement of `insert` to fail out of band.
+    store
+        .exec_script("DROP TABLE derived_marks;")
+        .expect("drop derived_marks out of band");
+    let err =
+        insert_with_unit(&store, "op-partial", &Unit::parse("degC").expect("unit"), 2).unwrap_err();
+    assert_eq!(
+        err.code(),
+        "sqlite-failure",
+        "failed second statement surfaces as sqlite failure, got {err}"
+    );
+    // No partial: the outbox INSERT rolled back with the failed batch.
+    let rows = store
+        .exec_script("SELECT COUNT(*) FROM outbox;")
+        .expect("count outbox without touching derived_marks");
+    assert_eq!(
+        rows.first()
+            .and_then(|cols| cols.first())
+            .map(String::as_str),
+        Some("1"),
+        "only the pre-existing row survives; the failed insert left no partial"
+    );
+    let ops = store
+        .exec_script("SELECT quote(operation) FROM outbox ORDER BY id;")
+        .expect("list operations");
+    assert_eq!(ops.len(), 1, "failed operation stored nothing");
 }
 
 // ---------------------------------------------------------------------------
