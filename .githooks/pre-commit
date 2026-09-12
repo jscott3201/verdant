@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Verdant pre-commit: 700-line cap on `.rs` files (grandfather + enforce-forward).
+#
+# Line definition: TOTAL lines of the staged blob, measured as
+#   `git show :path | wc -l`
+# (not added-lines, not code-only lines). Simple and predictable by design.
+#
+# Rules (checked only on staged `.rs` files, Added/Copied/Modified):
+#   - staged <= 700                              -> pass.
+#   - staged > 700 and path is NEW (not in HEAD) -> FAIL (new file over cap).
+#   - staged > 700 and HEAD exists:
+#       - HEAD > 700: grandfathered; FAIL only if staged > HEAD (no growth
+#         allowed); pass if staged <= HEAD (shrinking toward the cap is fine).
+#       - HEAD <= 700: FAIL (new violation on a previously compliant file).
+#
+# Notes:
+#   - Only the ACM diff-filter is inspected, so renames without content
+#     changes and deletions are ignored; a missing staged blob is skipped
+#     safely. Filenames with spaces are handled via NUL-delimited paths.
+#   - An empty staged `.rs` set exits 0. Failure lists every violating file
+#     with staged/HEAD counts and exits 1. Success is silent.
+#   - Local-only enforcement: product CI never runs git hooks (fresh clones
+#     enable with `git config core.hooksPath .githooks`).
+set -u
+
+CAP=700
+failures=""
+
+# NUL-delimited to survive filenames with spaces/newlines.
+while IFS= read -r -d '' file; do
+  [ -n "$file" ] || continue
+  # Guard: staged blob may be gone (e.g. raced delete); ACM filter should
+  # already exclude deletions, but never fail the commit on a missing blob.
+  if ! git cat-file -e ":$file" 2>/dev/null; then
+    continue
+  fi
+  staged_count="$(git show ":$file" 2>/dev/null | wc -l)"
+  # `wc -l` pads with spaces; strip to a bare integer.
+  staged_count="$(printf '%s' "$staged_count" | tr -d '[:space:]')"
+  case "$staged_count" in
+    ''|*[!0-9]*) continue ;;
+  esac
+  if [ "$staged_count" -le "$CAP" ]; then
+    continue
+  fi
+  # Over cap: resolve HEAD count, if the path exists there.
+  if git cat-file -e "HEAD:$file" 2>/dev/null; then
+    head_count="$(git show "HEAD:$file" 2>/dev/null | wc -l)"
+    head_count="$(printf '%s' "$head_count" | tr -d '[:space:]')"
+    case "$head_count" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    if [ "$head_count" -gt "$CAP" ]; then
+      # Grandfathered file: only growth fails.
+      if [ "$staged_count" -gt "$head_count" ]; then
+        failures="${failures}  $file (staged $staged_count, HEAD $head_count): grandfathered file grew — no growth allowed over $CAP lines; shrink to <= $head_count (ideally <= $CAP).""$(printf '\n')"
+      fi
+    else
+      failures="${failures}  $file (staged $staged_count, HEAD $head_count): new violation — previously within cap ($CAP), staged exceeds it; split the file.""$(printf '\n')"
+    fi
+  else
+    failures="${failures}  $file (staged $staged_count, HEAD new): new file over cap ($CAP); split into smaller modules before committing.""$(printf '\n')"
+  fi
+done < <(git diff --cached --name-only -z --diff-filter=ACM -- '*.rs')
+
+if [ -n "$failures" ]; then
+  {
+    echo "pre-commit: .rs $CAP-line cap violated (line = total staged lines via 'git show :path | wc -l'):"
+    printf '%s' "$failures"
+    echo "Split guidance: divide by responsibility into new modules under src/ via the integration owner (single-crate workspace; no empty per-feature crates), keep matches exhaustive and errors typed, and keep contract fixtures independent."
+  } >&2
+  exit 1
+fi
+exit 0
