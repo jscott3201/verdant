@@ -40,6 +40,13 @@ pub enum NativeError {
     /// A tested facade resource ceiling was exhausted (statement bytes or
     /// store bytes). Refused BEFORE the work is promised or attempted.
     ResourceLimit { detail: String },
+    /// Observed store/maintenance capacity or a Selene resource budget exhausted.
+    /// Operator action is required; not a host-global quota or disk-full proof.
+    MaintenanceRequired { detail: String },
+    /// Native durable filesystem mode is unavailable on this platform.
+    UnsupportedPlatform { detail: String },
+    /// CURRENT may select a complete new snapshot. Never retry blindly.
+    CheckpointUncertain { detail: String },
     /// The owning handle is fenced after uncertainty: no more writes or
     /// checkpoints on this owner; drop every handle and reopen.
     Fenced { detail: String },
@@ -76,6 +83,9 @@ impl NativeError {
             NativeError::Contention { .. } => "contention",
             NativeError::Busy { .. } => "busy",
             NativeError::ResourceLimit { .. } => "resource-limit",
+            NativeError::MaintenanceRequired { .. } => "maintenance-required",
+            NativeError::UnsupportedPlatform { .. } => "unsupported-platform",
+            NativeError::CheckpointUncertain { .. } => "checkpoint-uncertain",
             NativeError::Fenced { .. } => "fenced",
             NativeError::Integrity { .. } => "integrity",
             NativeError::Semantic { .. } => "semantic",
@@ -121,9 +131,11 @@ impl NativeError {
                 detail,
             },
             K::Contention => NativeError::Contention { detail },
-            K::ResourceLimit => NativeError::ResourceLimit { detail },
+            K::ResourceLimit => NativeError::MaintenanceRequired { detail },
             K::Fenced => NativeError::Fenced { detail },
-            K::Integrity
+            K::MissingArtifact
+            | K::InvalidArtifact
+            | K::Integrity
             | K::Corruption
             | K::IncompleteTail
             | K::IncompleteRequired
@@ -137,15 +149,9 @@ impl NativeError {
             K::Semantic | K::NativeAdmission | K::InvalidState | K::InMemory => {
                 NativeError::Semantic { detail }
             }
-            K::Io
-            | K::UnsupportedPlatform
-            | K::MissingArtifact
-            | K::InvalidArtifact
-            | K::CheckpointUncertain => NativeError::Lifecycle {
-                phase,
-                kind: kind_name,
-                detail,
-            },
+            K::Io => NativeError::Io { path: dir_string, message: detail },
+            K::UnsupportedPlatform => NativeError::UnsupportedPlatform { detail },
+            K::CheckpointUncertain => NativeError::CheckpointUncertain { detail },
             _ => NativeError::Lifecycle {
                 phase,
                 kind: kind_name,
@@ -162,7 +168,7 @@ impl NativeError {
     /// never conflated with "bad statement, retry".
     pub fn from_statement(err: selene_db::Error) -> NativeError {
         NativeError::StatementRejected {
-            detail: format!("{err}"),
+            detail: format!("execute/{:?} status={:?}: {err}", err.kind(), err.gqlstatus()),
         }
     }
 
@@ -175,7 +181,22 @@ impl NativeError {
     /// graph is quarantine-class, never statement-rejected.
     pub fn from_activation(err: selene_db::Error) -> NativeError {
         NativeError::Integrity {
-            detail: format!("lifecycle activation failed (not our lifecycle, quarantine): {err}"),
+            detail: format!("lifecycle activation/{:?} status={:?} failed (not our lifecycle, quarantine): {err}", err.kind(), err.gqlstatus()),
+        }
+    }
+
+    /// Narrow adapter for callers whose storage view governs. Do not turn
+    /// integrity, uncertain publication, I/O or bad statements into exhaustion.
+    pub fn storage_maintenance_error(&self) -> Option<crate::storage::StorageError> {
+        match self {
+            Self::MaintenanceRequired { detail } => Some(crate::storage::StorageError::MaintenanceRequired { detail: detail.clone() }),
+            Self::InvalidInput { .. } | Self::UnsupportedFormat { .. }
+            | Self::Compatibility { .. } | Self::AlreadyInitialized { .. }
+            | Self::NotInitialized { .. } | Self::Contention { .. } | Self::Busy { .. }
+            | Self::ResourceLimit { .. } | Self::UnsupportedPlatform { .. }
+            | Self::CheckpointUncertain { .. } | Self::Fenced { .. }
+            | Self::Integrity { .. } | Self::Semantic { .. } | Self::StatementRejected { .. }
+            | Self::Io { .. } | Self::Lifecycle { .. } => None,
         }
     }
 }
@@ -225,6 +246,9 @@ impl fmt::Display for NativeError {
                     "native resource ceiling exhausted (refused before promise): {detail}"
                 )
             }
+            NativeError::MaintenanceRequired { detail } => write!(f, "native maintenance required: {detail}"),
+            NativeError::UnsupportedPlatform { detail } => write!(f, "native platform unsupported: {detail}"),
+            NativeError::CheckpointUncertain { detail } => write!(f, "native checkpoint uncertain (drop all owners and inspect on reopen; never retry blindly): {detail}"),
             NativeError::Fenced { detail } => {
                 write!(
                     f,

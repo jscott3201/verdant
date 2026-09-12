@@ -84,11 +84,11 @@ pub use error::NativeError;
 pub use handle::NativeHandle;
 #[allow(unused_imports)]
 pub use report::{
-    CheckpointReport, ClosedStore, ExecReport, MaintenanceOutcome, OpenReport, PruneReport,
+    CheckpointOutcome, CheckpointReport, ClosedStore, ExecReport, MaintenanceOutcome, OpenReport, PruneOutcome, PruneReport,
     Readiness, RecoverySummary,
 };
 #[allow(unused_imports)]
-pub use settings::{NativeBounds, NativeSettings};
+pub use settings::{MaintenancePlan, NativeBounds, NativeSettings};
 
 /// Exact Selene `development` commit qualified by this validation (D05).
 pub const SELENE_REV: &str = "b65c2344c916d2c3ceeb72cefcd72e7960e95e25";
