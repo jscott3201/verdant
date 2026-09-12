@@ -1,0 +1,42 @@
+{
+  "content_hash": "FNV-1a 64 hex over canonical bytes, synthetic-only, not cryptographic; preserved verbatim through conversion",
+  "out_of_scenario_examples": [
+    {
+      "curated_class": "brick:Boiler",
+      "reason": "known Brick class but outside tiny_site scenario for this profile (v1 covers only AHU, VAV and SAT sensor)"
+    },
+    {
+      "curated_class": "brick:Chiller",
+      "reason": "known Brick class but outside tiny_site scenario for this profile (v1 covers only AHU, VAV and SAT sensor)"
+    },
+    {
+      "curated_class": "brick:Meter",
+      "reason": "known Brick class but outside tiny_site scenario for this profile (v1 covers only AHU, VAV and SAT sensor)"
+    }
+  ],
+  "profile": "verdant-pinned-brick-223p-rec-v1",
+  "provenance": "offline curated synthetic subset for M01-PR06; not fetched from Brick, ASHRAE 223P or RealEstateCore; no network; covers only the tiny_site shape (AHU plus two VAVs plus shared supply-air temperature sensor); broader Brick, 223P and REC coverage is explicitly out of scope for v1",
+  "revision": "BindingRevision bumps by one on an applied conversion that changes digests; preserved on no-op with identical profile plus input and content digests",
+  "scope": "tiny_site shape only: ahu-1 (AHU), vav-101 and vav-102 (VAV, duplicate label VAV), sensor-sat-1 (supply-air temperature sensor, shared scale degC); every other class is out-of-scenario or unknown",
+  "supported": [
+    {
+      "curated_class": "brick:AHU",
+      "notes": "curated Brick AHU alias; 223P and REC AHU alignment noted but the same verdant kind in v1",
+      "slot_pattern": "ahu-*",
+      "verdant_kind": "ahu"
+    },
+    {
+      "curated_class": "brick:Supply_Air_Temperature_Sensor",
+      "notes": "curated Brick SAT sensor alias; shared scale degC in the tiny_site shape",
+      "slot_pattern": "sensor-sat-*",
+      "verdant_kind": "sensor-sat"
+    },
+    {
+      "curated_class": "brick:VAV",
+      "notes": "curated Brick VAV alias; 223P and REC VAV alignment noted but the same verdant kind in v1",
+      "slot_pattern": "vav-*",
+      "verdant_kind": "vav"
+    }
+  ],
+  "verdant_namespace": "verdant:v1"
+}
