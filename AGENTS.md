@@ -7,8 +7,11 @@ tutorial bloat.
 
 ## Project overview
 
-- One Rust binary crate (`verdant`, `src/main.rs`), zero dependencies
-  (std-only). `Cargo.toml` sets `publish = false`.
+- One Rust binary crate (`verdant`, `src/main.rs`) with exactly one direct
+  dependency (`selene-db 2.0.0-alpha.1` at git rev
+  `b65c2344c916d2c3ceeb72cefcd72e7960e95e25`, default features); system
+  `sqlite3` 3.54.0 is driven via `std::process`, not linked.
+  `Cargo.toml` sets `publish = false`.
 - All builds and tests run with `--locked`; the toolchain is pinned to 1.97.1
   by `rust-toolchain.toml` (changing the pin is an owner decision, not a
   build convenience).
