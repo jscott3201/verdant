@@ -1,0 +1,14 @@
+case valid-standalone-start-stop executed tests/role_boundaries.rs valid_standalone_starts_and_stops :: starts, prints starting+stopped, observed exit 0
+case valid-edge-start-stop executed tests/role_boundaries.rs valid_edge_starts_and_stops :: same constrained path as standalone
+case valid-hub-start-stop executed tests/role_boundaries.rs valid_hub_starts_and_stops :: same constrained path as standalone
+case refuse-unknown-role executed tests/role_boundaries.rs refuses_unknown_role :: names the bad value and lists standalone/edge/hub
+case refuse-unknown-key executed tests/role_boundaries.rs refuses_unknown_key :: strict keys; allowed set named
+case refuse-missing-durable-path executed tests/role_boundaries.rs refuses_missing_durable_path :: fails without creating the directory
+case refuse-unresolved-secret executed tests/role_boundaries.rs refuses_unresolved_secret :: unset/empty secret_env is a refusal; value never logged
+case field-capability-absent executed tests/role_boundaries.rs refuses_field_listener_request :: field_listener=true and [field] both refused
+case no-field-listener-by-default executed tests/role_boundaries.rs omitted_field_setting_starts_no_listener :: omitted/false setting starts no listener; run reports listener=none
+case version-health-diagnostics executed tests/role_boundaries.rs version_and_health_report_build_inventory :: version/health print compiler/target/profile/deps/features/native libs
+case selene-library-oce-inventory report-only validation handoff (no implementation) :: actual compatibility inventoried; native engine deferred to M01-PR05 per D05
+case durable-stores blocked M01-PR03 owns SQLite transactions/stores :: PR01 links no sqlite; missing schema must not become an empty usable store
+case native-lifecycle blocked M01-PR05 owns public Selene lifecycle :: no native engine, salvage, or graph server here
+case other-targets untested none (one supported target built first) :: only the reported target_tested is claimed; all others remain untested
