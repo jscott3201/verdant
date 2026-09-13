@@ -243,6 +243,34 @@ fn close_reopen_preserves_committed_state_via_wal_replay() {
     // on open. This is in-process WAL-replay evidence, not SIGKILL proof.
     // Reopen through the recorded close authority (ClosedStore::open).
     let closed = handle.close();
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // All fixture native owners are dropped. Synchronize on the actual
+        // writer LOCK, not a fixed delay or a retried product operation.
+        let native_path = &closed.dir;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     let (reopened, report) = closed.open().expect("reopen");
     let recovery = report.recovery.expect("open reports its recovery work");
     // The five committed inserts (plus the lifecycle schema/graph writes)
@@ -266,6 +294,34 @@ fn maintenance_preserves_evidence_across_restart() {
     let outcome = handle.maintain().and_then(native::MaintenanceOutcome::report).expect("maintain");
     assert!(outcome.prune.cleanup_error.is_none());
     let closed = handle.close();
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // All fixture native owners are dropped. Synchronize on the actual
+        // writer LOCK, not a fixed delay or a retried product operation.
+        let native_path = &closed.dir;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     let (reopened, _) = closed.open().expect("reopen");
     assert_eq!(count_rows(&reopened), 6);
     // Steady restart timing shape: a post-restart checkpoint still selects.
@@ -286,6 +342,34 @@ fn over_budget_statement_refused_before_promise() {
     assert!(tight.validate().is_ok());
     let dir = handle.dir().to_path_buf();
     drop(handle.close());
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // All fixture native owners are dropped. Synchronize on the actual
+        // writer LOCK, not a fixed delay or a retried product operation.
+        let native_path = &dir;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     let (handle, _) = NativeHandle::open(&dir, tight).expect("reopen with tight ceiling");
 
     let long = "MATCH (r:Reading) RETURN r, r AS s, r AS t, r AS u, r AS v, r AS w";
@@ -302,6 +386,34 @@ fn over_budget_store_refused_before_promise() {
     let scratch = Scratch::new("store-budget");
     let (handle, dir) = create_with_rows(&scratch, "store", 2);
     drop(handle.close());
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // All fixture native owners are dropped. Synchronize on the actual
+        // writer LOCK, not a fixed delay or a retried product operation.
+        let native_path = &dir;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     // A ceiling below any real fresh store refuses activation itself.
     let tiny = NativeSettings {
         bounds: NativeBounds {
@@ -462,6 +574,34 @@ fn data2_foreign_store_without_lifecycle_is_integrity() {
     let dir = scratch.store("foreign");
     let raw = selene_db::Database::create(&dir).expect("raw Selene create");
     drop(raw);
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // All fixture native owners are dropped. Synchronize on the actual
+        // writer LOCK, not a fixed delay or a retried product operation.
+        let native_path = &dir;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     let err =
         NativeHandle::open(&dir, local_settings()).expect_err("foreign store must not activate");
     assert_eq!(

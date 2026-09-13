@@ -188,10 +188,15 @@ impl Drop for Reap {
 }
 fn kill_activated_owner(root: &Scratch) {
     use std::os::unix::process::ExitStatusExt;
+    // Declare before Reap so unwinding also reaps before closing the write end.
+    let owner_stdin;
     let mut child = Reap(Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD, "--nocapture"])
         .env(CHILD_ENV, &root.0).env("HOME", &root.0)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+    // Child::wait closes attached stdin before waiting. SIGKILL delivery can
+    // race that EOF, so retain the pipe separately through the observed reap.
+    owner_stdin = child.0.stdin.take().expect("piped owner stdin");
     let stdout = child.0.stdout.take().unwrap();
     let stderr = child.0.stderr.take().unwrap();
     let (ready, waiting) = std::sync::mpsc::channel();
@@ -218,6 +223,7 @@ fn kill_activated_owner(root: &Scratch) {
     let errors = errors.join().unwrap();
     assert!(ready.is_ok(), "child did not reach COMMIT: {output}\n{errors}");
     assert_eq!(status.signal(), Some(9));
+    drop(owner_stdin);
     assert!(errors.is_empty(), "{errors}");
     assert!(output.contains("M01_G_ACTIVATED_COMMIT_READY"));
     println!("M01_G observed_owner_signal=9 reaped=true after_commit=true (not power-loss)");

@@ -100,12 +100,14 @@ fn r09_fixed_measurements() {
     assert!(matches!(err, NativeError::Contention { .. }));
     assert_eq!(before, files(&scratch.0));
     let closed = handle.close();
+    wait_for_writer_release(&scratch.0);
     let before = files(&scratch.0);
     let (handle, reopened) = closed.open().expect("reopen");
     assert_eq!(before, files(&scratch.0));
     assert_eq!(reopened.recovery.expect("recovery").replayed_suffix_records, 0);
     println!("FIXED reopen={reopened:?}");
     drop(handle);
+    wait_for_writer_release(&scratch.0);
     let mut settings = NativeSettings::local();
     settings.bounds.max_store_bytes = bytes(&scratch.0);
     let (handle, _) = NativeHandle::open(&scratch.0, settings).expect("exact ceiling");
@@ -285,11 +287,13 @@ fn r09_bootstrap_refusals_and_stale_close_authority_preserve_files() {
     assert!(matches!(NativeHandle::create(&scratch.0, NativeSettings::local()), Err(NativeError::UnsupportedFormat { .. } | NativeError::AlreadyInitialized { .. })));
     assert_eq!(before, files(&scratch.0));
     drop(clone);
+    wait_for_writer_release(&scratch.0);
     let (handle, report) = closed.open().expect("owner released");
     assert_eq!(report.recovery.expect("replayed").replayed_suffix_records, 3);
     assert_eq!(before, files(&scratch.0));
     assert_eq!(handle.execute("MATCH (r:Reading) RETURN r").expect("row intact").row_count, Some(1));
     drop(handle);
+    wait_for_writer_release(&scratch.0);
     let before = files(&scratch.0);
     tight.bounds.max_store_bytes = bytes(&scratch.0) - 1;
     assert_eq!(NativeHandle::open(&scratch.0, tight).expect_err("over-capacity activation").code(), "maintenance-required");
@@ -322,6 +326,7 @@ fn r09_prune_views_and_partial_maintenance_outcome() {
     assert!(report.retained_bytes > verified_after.snapshot_bytes + verified_after.captured_wal_bytes);
     println!("FIXED qualitative whole-dir {} -> {}; Selene accounted {} -> {}; selected snapshot+captured WAL={} (different mapping)", report.store_bytes_before, report.store_bytes_after, report.retained_bytes + report.removed_bytes, report.retained_bytes, verified_after.snapshot_bytes + verified_after.captured_wal_bytes);
     drop(handle);
+    wait_for_writer_release(&scratch.0);
     let mut settings = NativeSettings::local();
     settings.bounds.native_reserve_bytes = 128;
     settings.bounds.future_journal_reserve_bytes = 256;
@@ -357,6 +362,7 @@ fn r09_foreign_artifact_refused_without_changing_any_file() {
     assert!(matches!(prune, NativeError::UnsupportedFormat { .. }));
     assert_eq!(before, files(&scratch.0));
     drop(handle);
+    wait_for_writer_release(&scratch.0);
     let open = NativeHandle::open(&scratch.0, NativeSettings::local()).expect_err("strict open");
     assert!(matches!(open, NativeError::UnsupportedFormat { .. }));
     assert_eq!(before, files(&scratch.0));
@@ -374,6 +380,7 @@ fn r09_post_checkpoint_dirty_recovery_repair_and_shutdown() {
         let dirty = files(&scratch.0);
         assert_ne!(dirty, BTreeMap::new());
         let closed = handle.close(); // Dirty means committed suffix, not corrupt bytes.
+        wait_for_writer_release(&scratch.0);
         assert_eq!(dirty, files(&scratch.0));
         let (handle, reopened) = closed.open().expect("recover dirty suffix");
         let recovery = reopened.recovery.expect("RecoverySummary");
@@ -396,6 +403,7 @@ fn r09_post_checkpoint_dirty_recovery_repair_and_shutdown() {
         assert_eq!(repeated.bytes, repaired.checkpoint.bytes);
         assert_eq!(stable, files(&scratch.0));
         let closed = handle.close();
+        wait_for_writer_release(&scratch.0);
         assert_eq!(stable, files(&scratch.0));
         let (handle, shutdown_reopen) = closed.open().expect("open after repaired shutdown");
         let clean = shutdown_reopen.recovery.expect("post-shutdown RecoverySummary");
@@ -417,6 +425,7 @@ fn r09_open_race_retains_original_winner_and_typed_gql_refusal() {
         let (handle, _) = NativeHandle::create(&scratch.0, NativeSettings::local()).expect("create");
         insert(&handle, 1);
         let closed = handle.close();
+        wait_for_writer_release(&scratch.0);
         let before = files(&scratch.0);
         let mut winners = Vec::new();
         if established { winners.push(closed.open().expect("established open winner")); }

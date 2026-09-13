@@ -42,6 +42,34 @@ impl Setup {
         drop(registry);
         drop(gate);
         drop(native.close());
+        {
+            use std::fs::{OpenOptions, TryLockError};
+            use std::time::{Duration, Instant};
+            // All fixture native owners are dropped. Synchronize on the actual
+            // writer LOCK, not a fixed delay or a retried product operation.
+            let native_path = scratch.0.join("native");
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(native_path.join("LOCK"))
+                .expect("existing writer LOCK");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match lock.try_lock() {
+                    Ok(()) => break,
+                    Err(TryLockError::WouldBlock) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "writer LOCK not released: {}",
+                            native_path.display()
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+                }
+            }
+            lock.unlock().expect("release synchronization lock");
+        }
         (scratch, sequence)
     }
 }
@@ -76,10 +104,38 @@ impl Owners {
     }
     pub fn close(self) {
         let Self { gate, registry, native, seals } = self;
+        let native_path = native.dir().to_path_buf();
         drop(seals);
         drop(registry);
         drop(gate);
         drop(native.close());
+        {
+            use std::fs::{OpenOptions, TryLockError};
+            use std::time::{Duration, Instant};
+            // All fixture native owners are dropped. Synchronize on the actual
+            // writer LOCK, not a fixed delay or a retried product operation.
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(native_path.join("LOCK"))
+                .expect("existing writer LOCK");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match lock.try_lock() {
+                    Ok(()) => break,
+                    Err(TryLockError::WouldBlock) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "writer LOCK not released: {}",
+                            native_path.display()
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+                }
+            }
+            lock.unlock().expect("release synchronization lock");
+        }
     }
 }
 

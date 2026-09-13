@@ -83,6 +83,34 @@ fn fixed_close_reopen_preserves_exact_accepted_revision_authorship_and_separate_
     drop(registry);
     drop(gate);
     let closed = native.close(); // every native clone above has been dropped
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // All fixture native owners are dropped. Synchronize on the actual
+        // writer LOCK, not a fixed delay or a retried product operation.
+        let native_path = scratch.native();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     let (native, _) = closed.open().unwrap();
     let gate = access::AccessGate::open(
         &scratch.db(),
