@@ -322,9 +322,37 @@ fn fixed_missing_native_content_on_reopen_blocks_new_acceptance() {
     let db_path = f.scratch.db();
     drop(f.seals);
     drop(f.native);
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // Both native owners are dropped. As in R09, synchronize fixture setup
+        // on the actual Selene writer LOCK: CI observed contention immediately
+        // after drop. Never retry the product open or accept a reopen refusal.
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     std::fs::remove_file(native_path.join(format!("SNAPSHOT-{generation:020}.logical"))).unwrap();
-    // Reopen is a concrete native attempt. Missing required native data may
-    // itself refuse; if it opens, recovered seal availability must refuse.
+    // The older retained snapshot must reopen; recovered seal availability
+    // must then refuse the missing sealed generation.
     match crate::native::NativeHandle::open(&native_path, crate::native::NativeSettings::local()) {
         Ok((native, _)) => {
             let seals = availability_store(&db_path, native);

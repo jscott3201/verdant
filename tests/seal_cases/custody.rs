@@ -71,6 +71,35 @@ fn raw_reopen_cannot_bypass_guard_and_application_reopen_recovers_live_seals() {
     );
     drop(f.seals);
     let closed = f.native.close();
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // Both native owners are dropped. As in R09, synchronize fixture setup
+        // on the actual Selene writer LOCK: contention was observed immediately
+        // after drop. Never retry the product open or accept a reopen refusal.
+        let native_path = f.scratch.native();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     let (native, _) = closed.open().unwrap();
     let native::NativeError::Custody { plan } = native.prune().unwrap_err() else {
         panic!("unguarded reopened prune accepted");
