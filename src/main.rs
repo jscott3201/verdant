@@ -32,6 +32,7 @@ mod semantics;
 mod binding;
 mod seal;
 mod accept;
+mod api;
 
 use config::{load_from_path, Role};
 use std::env;
