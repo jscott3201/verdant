@@ -38,13 +38,13 @@ fn fixed_stages_events_reopen_and_not_yet_seam() {
     );
     assert_eq!(reopened.read_staged(&op).unwrap(), staged);
     let before = (counts(&f), bytes(&f));
-    for stage in [Stage::Activated, Stage::Qualified] {
+    for stage in [Stage::Qualified] {
         let error = store.transition(&accepted, stage).unwrap_err();
         assert_eq!(error.code(), "accept-not-yet");
         assert!(matches!(error, Error::NotYet { requested } if requested == stage));
     }
     assert_eq!(before, (counts(&f), bytes(&f)));
-    println!("FIXED staged -> sealed -> accepted revision=1 event_row={} reopened; activated/qualified=not-yet, rows+bytes unchanged", accepted.row_id);
+    println!("FIXED staged -> sealed -> accepted revision=1 event_row={} reopened; qualified=not-yet, rows+bytes unchanged", accepted.row_id);
 }
 
 #[test]

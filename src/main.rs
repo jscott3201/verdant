@@ -31,6 +31,7 @@ mod semantics;
 #[allow(dead_code)]
 mod binding;
 mod seal;
+mod accept;
 
 use config::{load_from_path, Role};
 use std::env;

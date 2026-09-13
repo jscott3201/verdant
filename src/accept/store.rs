@@ -45,6 +45,12 @@ impl AcceptanceRequest {
     pub fn seal(&self) -> &Digest {
         &self.seal
     }
+    pub fn scope(&self) -> &TrustedScope {
+        &self.scope
+    }
+    pub fn staged_operation(&self) -> &OperationId {
+        &self.staged_operation
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +99,12 @@ impl AcceptanceStore {
     /// Accepted does NOT mean available/activated; missing content cannot erase
     /// the event. Fresh acceptance separately checks seal availability.
     pub fn status(&self, sealed: &Sealed) -> Result<Stage> {
+        if self.active(sealed.config().scope())?.is_some_and(|a| {
+            a.request().acceptance().seal() == sealed.identity()
+                && a.request().acceptance().staged_operation() == sealed.staged().operation()
+        }) {
+            return Ok(Stage::Activated);
+        }
         if self.history(sealed.config().scope())?.iter().any(|a| {
             a.request.seal == sealed.identity
                 && a.request.staged_operation == sealed.staged.operation
@@ -103,11 +115,12 @@ impl AcceptanceStore {
         }
     }
 
-    /// No fake activation or qualification. Slice B must supply its own checked
-    /// coordination contract before these transitions can be implemented.
+    /// A stage enum alone carries no generation or operation identity. Activation
+    /// requires activate/prepare_activation; qualification remains future work.
     pub fn transition(&self, _accepted: &Accepted, requested: Stage) -> Result<()> {
         match requested {
-            Stage::Activated | Stage::Qualified => Err(Error::NotYet { requested }),
+            Stage::Qualified => Err(Error::NotYet { requested }),
+            Stage::Activated => Err(Error::Invalid("use activation request API")),
             Stage::Staged | Stage::Sealed | Stage::Accepted => {
                 Err(Error::Invalid("use stage/sealed/prepare APIs"))
             }
@@ -271,7 +284,7 @@ impl AcceptanceStore {
         Ok(found)
     }
 
-    fn history(&self, scope: &TrustedScope) -> Result<Vec<Accepted>> {
+    pub(super) fn history(&self, scope: &TrustedScope) -> Result<Vec<Accepted>> {
         let rows = self.store.exec_script(&format!(
             "SELECT id,quote(value_json),seq,sensor FROM outbox WHERE {} ORDER BY id LIMIT {};",
             predicate(scope),
@@ -328,7 +341,7 @@ impl AcceptanceStore {
     }
 }
 
-fn event_bytes(request: &AcceptanceRequest, actor: &str) -> Result<String> {
+pub(super) fn event_bytes(request: &AcceptanceRequest, actor: &str) -> Result<String> {
     Ok(codec::encode(&[
         "verdant-accepted-v1".into(),
         request.operation.as_str().into(),
@@ -344,7 +357,7 @@ fn event_bytes(request: &AcceptanceRequest, actor: &str) -> Result<String> {
 fn entity(scope: &TrustedScope) -> String {
     format!("accept-{}", scope.as_str())
 }
-fn predicate(scope: &TrustedScope) -> String {
+pub(super) fn predicate(scope: &TrustedScope) -> String {
     format!(
         "operation='{EVENT}' AND entity={}",
         binding::sql_quote(&entity(scope))
