@@ -103,6 +103,34 @@ fn fixed_shell_verbs_retries_diagnostics_recovery_and_refusals() {
     // Release every native owner before another process opens the fixture.
     let Fixture { gate, registry, native, seals, scratch, .. } = f;
     drop(seals); drop(native); drop(registry); drop(gate);
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // All fixture native owners are dropped. Synchronize on the actual
+        // writer LOCK, not a fixed delay or a retried product operation.
+        let native_path = scratch.native();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     let output = std::process::Command::new("bash")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cli_cases/verbs.sh"))
         .arg(env!("CARGO_BIN_EXE_verdant")).arg(&scratch.0)
