@@ -65,6 +65,34 @@ fn missing_native_content_blocks_only_named_capability_without_rollback() {
     let generation = f.reference.generation();
     drop(f.seals);
     drop(f.native);
+    {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::time::{Duration, Instant};
+        // Both native owners are dropped. As in R09, synchronize fixture setup
+        // on the actual Selene writer LOCK: contention was observed immediately
+        // after drop. Never retry the product open or accept a reopen refusal.
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_path.join("LOCK"))
+            .expect("existing writer LOCK");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "writer LOCK not released: {}",
+                        native_path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryLockError::Error(error)) => panic!("writer LOCK probe failed: {error}"),
+            }
+        }
+        lock.unlock().expect("release synchronization lock");
+    }
     std::fs::remove_file(native_path.join(format!("SNAPSHOT-{generation:020}.logical"))).unwrap();
     let (native, _) = crate::native::NativeHandle::open(&native_path, crate::native::NativeSettings::local()).unwrap();
     let seals = availability_store(&db, native);
