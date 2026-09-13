@@ -89,7 +89,46 @@ pub struct WorkStatus {
     pub effect_known: bool,
 }
 
+/// Original seal intent identity, never an identity invented by a read/retry.
+/// Pending includes canceled intents: neither cancellation nor intent is a seal.
+#[derive(Debug)]
+pub enum SealLookup {
+    Committed {
+        operation: OperationId,
+        commit: crate::seal::SealCommit,
+    },
+    Pending {
+        operation: OperationId,
+    },
+}
+
 impl Api<'_> {
+    /// Authenticated, read-only lookup by draft or one of its revision IDs.
+    /// Returns the original operation and receipt-verified commit, or explicit
+    /// pending intent. Missing draft/stage/seal is `api-missing-content`;
+    /// malformed history, unavailable content and reconciliation errors propagate.
+    /// This does not dispatch pending work, grant publication, or refresh content.
+    pub fn sealed(
+        &self,
+        credential: Option<&Credential>,
+        scope: &TrustedScope,
+        revision: &OperationId,
+    ) -> Result<SealLookup> {
+        let draft = self.read(credential, scope, revision)?;
+        let intent = self.intents(scope)?.into_iter()
+            .find(|i| i.kind == Kind::Seal && i.subject == draft.draft)
+            .ok_or_else(|| Error::Missing(format!("seal:{}", draft.draft.as_str())))?;
+        Ok(match self.seal_effect(&intent)? {
+            Some(commit) => SealLookup::Committed {
+                operation: intent.operation,
+                commit,
+            },
+            None => SealLookup::Pending {
+                operation: intent.operation,
+            },
+        })
+    }
+
     pub fn status(
         &self,
         credential: Option<&Credential>,

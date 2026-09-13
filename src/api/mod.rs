@@ -19,7 +19,7 @@ mod recovery;
 pub(crate) use operations::on_draft_boundary;
 pub use operations::{DraftContent, DraftRevision, Publication, Reference};
 pub use readers::{
-    Availability, Diagnostic, Page, PageRequest, Readiness, ScopeStatus, WorkStatus,
+    Availability, Diagnostic, Page, PageRequest, Readiness, ScopeStatus, SealLookup, WorkStatus,
 };
 pub use recovery::RecoveryAction;
 
