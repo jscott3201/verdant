@@ -1,5 +1,7 @@
 //! Test-side source/artifact inventory, not a new product attestation surface.
 use crate::{native, query, seal, semantics, storage, support::clean, Scratch};
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -12,13 +14,13 @@ const OWNED: &[&str] = &[
     "tests/gate_cases/manifest.rs", "tests/gate_cases/enumeration.rs",
 ];
 
-pub fn run(exe: &str, args: &[&str]) -> String {
+pub fn run(exe: impl AsRef<OsStr>, args: &[&str]) -> String {
     clean(Command::new(exe).args(args).current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdin(Stdio::null()).output().unwrap())
 }
-pub fn digest(path: &Path) -> String {
+pub fn digest(path: &Path, hash_exe: &Path) -> String {
     let hash = || {
-        let output = clean(Command::new("/usr/bin/shasum").args(["-a", "256"])
+        let output = clean(Command::new(hash_exe).args(["-a", "256"])
             .arg(path).stdin(Stdio::null()).output().unwrap());
         let (hex, name) = output.trim_end().split_once("  ").unwrap();
         assert_eq!(name, path.to_str().unwrap());
@@ -31,8 +33,14 @@ pub fn digest(path: &Path) -> String {
     hex
 }
 fn executable(name: &str) -> PathBuf {
-    std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join(name)).find(|p| p.is_file()).unwrap().canonicalize().unwrap()
+    executable_in(name, &std::env::var_os("PATH").unwrap())
+        .unwrap_or_else(|| panic!("no executable {name} on PATH"))
+}
+fn executable_in(name: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path).map(|dir| dir.join(name))
+        .find(|p| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        // Preserve the selected invocation path, including a symlink's name.
+        .map(|p| std::path::absolute(p).unwrap())
 }
 
 fn version<const N: usize>(raw: &str) -> Option<[u64; N]> {
@@ -65,11 +73,56 @@ fn tool_versions_are_environment_relative_with_explicit_floors() {
     }
 }
 
+#[test]
+fn path_lookup_selects_first_executable_and_records_actual_tools() {
+    let root = Scratch::new();
+    let blocked = root.0.join("non-executable");
+    let directory = root.0.join("directory");
+    let sdk = root.0.join("Library/Android/sdk/platform-tools");
+    for dir in [&blocked, &directory, &sdk] { std::fs::create_dir_all(dir).unwrap(); }
+    let system = Path::new("/usr/bin");
+    let missing = root.0.join("missing");
+    let sdk_first = std::env::join_paths([missing.as_path(), &blocked, &directory, &sdk, system]).unwrap();
+    let system_first = std::env::join_paths([system, sdk.as_path()]).unwrap();
+    for name in ["sqlite3", "shasum"] {
+        let file = blocked.join(name);
+        std::fs::write(&file, b"not executable").unwrap();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::create_dir(directory.join(name)).unwrap();
+        // Alias the selected host tool: /usr/bin/sqlite3 itself may be older on CI.
+        std::os::unix::fs::symlink(executable(name), sdk.join(name)).unwrap();
+        for (path, expected) in [(&sdk_first, sdk.join(name)), (&system_first, system.join(name))] {
+            let resolved = executable_in(name, path).unwrap();
+            assert_eq!(resolved, expected);
+            let actual = clean(Command::new(name).arg("--version").env("PATH", path)
+                .stdin(Stdio::null()).output().unwrap());
+            assert_eq!(run(&resolved, &["--version"]), actual);
+            println!("M01_G_PATH {name}={} version={}", resolved.display(), actual.trim());
+        }
+        let unavailable = std::env::join_paths([&missing, &blocked, &directory]).unwrap();
+        assert!(executable_in(name, &unavailable).is_none());
+    }
+    // Re-exec only the clean journey: child-local PATH avoids racing other tests.
+    let path = std::env::join_paths(std::env::split_paths(&sdk_first)
+        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()))).unwrap();
+    let output = clean(Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "journey::setup_validate_seal_accept_activate_clean_restart_recover", "--nocapture"])
+        .env("PATH", path).stdin(Stdio::null()).output().unwrap());
+    assert!(output.contains("test result: ok. 1 passed; 0 failed;"));
+    for name in ["sqlite3", "shasum"] {
+        let resolved = sdk.join(name);
+        assert!(output.contains(&format!("{name}_executable={}\n", resolved.display())));
+        assert!(output.contains(&format!("sha256 {}=", resolved.display())));
+    }
+    println!("M01_G_PATH SDK-first clean journey passed; resolved paths and digests recorded");
+}
+
 pub struct Inventory {
     pub binary: String,
     pub host: String,
     pub text: String,
     hash_tool: String,
+    hash_exe: PathBuf,
 }
 impl Inventory {
     pub fn capture(root: &Scratch) -> Self {
@@ -103,20 +156,27 @@ impl Inventory {
         // The reviewed flag gate and SHA-256 known-answer probe enforce behavior.
         // Tool/binary bytes are host-relative: hash twice, check format, record;
         // never compare them to hardcoded bytes from a different build or host.
-        let sqlite = run("sqlite3", &["--version"]);
+        let sqlite_exe = executable("sqlite3");
+        let hash_exe = executable("shasum");
+        let sqlite = run(&sqlite_exe, &["--version"]);
         assert!(supported_sqlite(&sqlite), "unsupported sqlite3 version: {sqlite:?}");
-        let shasum = run("/usr/bin/shasum", &["--version"]);
+        let shasum = run(&hash_exe, &["--version"]);
         assert!(supported_shasum(&shasum), "unsupported shasum version: {shasum:?}");
-        let hash_tool = format!("/usr/bin/shasum -a 256; version={}", shasum.trim());
-        assert_eq!(executable("sqlite3"), Path::new("/usr/bin/sqlite3"));
-        assert_eq!(executable("shasum"), Path::new("/usr/bin/shasum"));
-        let binary_digest = digest(Path::new(env!("CARGO_BIN_EXE_verdant")));
+        // Product seals intentionally use a fixed path, unlike this independent
+        // PATH-resolved inventory hasher. Keep their provenance assertion exact.
+        let seal_hash_exe = Path::new("/usr/bin/shasum");
+        let seal_shasum = run(seal_hash_exe, &["--version"]);
+        assert!(supported_shasum(&seal_shasum), "unsupported seal shasum version: {seal_shasum:?}");
+        let hash_tool = format!("{} -a 256; version={}", seal_hash_exe.display(), seal_shasum.trim());
+        let binary_digest = digest(Path::new(env!("CARGO_BIN_EXE_verdant")), &hash_exe);
         let binary = format!("m01-gate-verdant-sha256-{binary_digest}");
         let host = "m01-gate-macos-arm64-debug".into();
         let mut text = format!(
             "head={head}\nbase={BASE}\nsource_state={}rust={rust}cargo={cargo}target=aarch64-apple-darwin\nprofile=debug\nsqlite3={sqlite}shasum={shasum}selene={SELENE}\nmigrations=0001_init,0002_receipts\nprofile_id={PROFILE}\nconverter={CONVERTER}\nbinary_sha256={binary_digest}\n",
             run("git", &["status", "--porcelain", "--untracked-files=all"]),
         );
+        text.push_str(&format!("sqlite3_executable={}\nshasum_executable={}\nseal_hash_tool={hash_tool}\n",
+            sqlite_exe.display(), hash_exe.display()));
         // Source bytes disambiguate an uncommitted test tree from HEAD. Digests of
         // system executables are measurements, not portable OS image pins.
         for file in OWNED.iter().copied().chain([
@@ -131,14 +191,17 @@ impl Inventory {
                 assert!(lines <= 700, "{file}: {lines} lines exceeds staged cap");
                 text.push_str(&format!("owned_lines {file}={lines}\n"));
             }
-            text.push_str(&format!("sha256 {file}={}\n", digest(&path)));
+            text.push_str(&format!("sha256 {file}={}\n", digest(&path, &hash_exe)));
         }
-        for file in ["/usr/bin/sqlite3", "/usr/bin/shasum"] {
-            text.push_str(&format!("sha256 {file}={}\n", digest(Path::new(file))));
+        for file in [sqlite_exe.as_path(), hash_exe.as_path()] {
+            text.push_str(&format!("sha256 {}={}\n", file.display(), digest(file, &hash_exe)));
+        }
+        if hash_exe != seal_hash_exe {
+            text.push_str(&format!("sha256 {}={}\n", seal_hash_exe.display(), digest(seal_hash_exe, &hash_exe)));
         }
         println!("M01_G_MANIFEST\n{text}");
         std::fs::write(root.0.join("m01-gate-manifest.txt"), &text).unwrap();
-        Self { binary, host, text, hash_tool }
+        Self { binary, host, text, hash_tool, hash_exe }
     }
     pub fn verify_seal(&self, commit: &seal::SealCommit) {
         let parts = fields(&commit.manifest.canonical_bytes());
@@ -157,9 +220,9 @@ impl Inventory {
     pub fn record_seal(&self, root: &Scratch, commit: &seal::SealCommit) {
         let path = root.0.join("m01-gate-seal-manifest.txt");
         std::fs::write(&path, commit.manifest.canonical_bytes()).unwrap();
-        // Hash actual canonical bytes through the fixed-path external tool, not the
+        // Hash actual canonical bytes through the resolved external tool, not the
         // product's Manifest::identity implementation or a digest-shaped string.
-        assert_eq!(digest(&path), commit.identity.as_str());
+        assert_eq!(digest(&path, &self.hash_exe), commit.identity.as_str());
         println!("M01_G_MANIFEST seal_sha256={} canonical_bytes={} native_refs=1 finding_refs=1",
             commit.identity.as_str(), std::fs::metadata(path).unwrap().len());
     }
