@@ -1,6 +1,6 @@
-//! M01-PR08A: effective configuration and staged/sealed/accepted transitions.
+//! M01-PR08: effective configuration and staged/sealed/accepted/activated transitions.
 //!
-//! Library-shaped module, deliberately not wired to the PR01 executable. Staging
+//! Library-shaped coordinator, compiled but not invoked by the CLI. Staging
 //! records intent as a seal ContentNode; publishing that node remains seal-owned.
 //! Acceptance is one SQLite event + receipt, NOT a native activation or 2PC.
 //! Each scope has a bounded, additive accepted-revision chain (256 events).
@@ -17,8 +17,14 @@
 //! admission loses the guarded transaction; external file/DB tampering remains
 //! outside the existing trusted-parent/guarded-writer model. Receipts are retained;
 //! stop/join dispatchers before treating a reconciliation absence as final.
+//! Activation adds a per-scope event pointer, not live graph mutation or physical
+//! authority. Native availability runs outside writer admission; the short SQLite
+//! transaction checks both current acceptance and active generation. No binding
+//! revision/building-wide lock spans that I/O. Readers/services belong to PR09.
 #![allow(dead_code)]
+#![allow(unused_imports)] // Re-exports consumed by isolated tests and future wiring.
 
+mod activation;
 mod codec;
 mod effective;
 mod publication;
@@ -30,6 +36,9 @@ pub use publication::{Sealed, Staged};
 #[cfg(test)]
 pub(crate) use store::on_boundary;
 pub use store::{AcceptanceRequest, AcceptanceStore, Accepted, PendingAcceptance};
+pub use activation::{Activated, ActivationRequest, ActiveGeneration, PendingActivation};
+#[cfg(test)]
+pub(crate) use activation::on_activation_boundary;
 
 use crate::domain::ids::OperationId;
 
@@ -89,6 +98,19 @@ pub enum Error {
     },
     /// Availability refusal does not erase an already committed acceptance.
     Blocked(crate::seal::SealError),
+    ActivationBlocked {
+        scope: crate::domain::scope::TrustedScope,
+        seal: crate::seal::Digest,
+        cause: crate::seal::SealError,
+    },
+    StaleGeneration {
+        expected: ActiveGeneration,
+        current: ActiveGeneration,
+    },
+    Superseded {
+        requested: AcceptedRevision,
+        current: AcceptedRevision,
+    },
     Unknown {
         operation: OperationId,
         detail: String,
@@ -109,6 +131,9 @@ impl Error {
             Self::EnvironmentOverride => "accept-environment-override",
             Self::NotYet { .. } => "accept-not-yet",
             Self::Blocked(_) => "accept-blocked",
+            Self::ActivationBlocked { .. } => "activation-blocked",
+            Self::StaleGeneration { .. } => "activation-stale-generation",
+            Self::Superseded { .. } => "activation-superseded",
             Self::Unknown { .. } => "accept-unknown",
             Self::Storage(e) => e.code(),
             Self::Binding(e) => e.code(),
