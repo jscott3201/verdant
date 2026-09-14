@@ -6,12 +6,15 @@ are goals, not delivered operational capabilities.
 
 > **Foundation, not a full application.** Storage, synthetic access, native
 > lifecycle, conversion and binding modules are compiled and exercised in
-> isolated tests. The configured executable still runs only the local
-> no-listener shell; it does not activate those subsystems.
+> isolated tests. Headless setup verbs open existing stores with synthetic local
+> credentials. The ordinary `run` command remains the no-field/no-listener shell;
+> it does not start the separately compiled inert runtime API.
 
 ## Current status
 
-M01 foundations remain in progress. Keep these evidence levels distinct:
+M01 deliveries are merged; their gate is bounded synthetic evidence, not real-site
+native-semantic qualification. M02-PR01A adds an inert composition seam, not a
+BACnet adapter or completion of parent PR01. Keep these evidence levels distinct:
 
 | Level | Current meaning / source |
 | --- | --- |
@@ -26,6 +29,65 @@ native-deferred/blocked rows, and a compiled-in SQLite `3.54.0` inventory string
 These are **not** current module-absence claims or a runtime SQLite version
 probe. Read them with the levels above and actual CI inventory below; the
 informational `evidence` report never proves that tests ran.
+
+### Current setup and inert runtime inventory
+
+`verdant capabilities` is the **separate current inventory**. Historical PR01
+`health` and `evidence` output remains unchanged. Setup verbs are `draft`, `edit`,
+`validate`, `seal`, `accept`, `status`, `read` and `recovery`; see `verdant --help`
+for their existing synthetic credential/configuration and operation-ID contracts.
+Acceptance and activation are different, and neither starts field work.
+
+The API-first [`runtime`](src/runtime/mod.rs) composition opens supported access,
+binding, native and seal owners once, retains them across stop/start, and reads
+exact accepted/active content through existing authenticated APIs. Startup checks
+seal availability as well as pointer identity. It accepts only explicit selected
+structurally valid sensing keys. A closed inert adapter returns
+`NotAttemptedInert`: no packet, sensor timestamp, observed value or qualification.
+There is no generic protocol client, listener, automatic polling, writable
+runtime API, observation spool or new migration. Ordinary `run` does not call it.
+
+One budget family counts queued work, actual jobs and retained results across
+the separate supported store handle families. These **fixture assumptions**, not
+measured capacity or facility settings, are enforced in
+[`admission.rs`](src/runtime/admission.rs):
+
+| Resource | Runtime fixture bound |
+| --- | --- |
+| Queued + running + retained-result slots | 64 total: 2 current-sensing, 2 reconciliation, 60 optional-discovery; mandatory slots cannot be borrowed |
+| Concurrent jobs (including SQLite/hash/native verification) | 4 total: 1 current-sensing, 1 reconciliation, 2 optional; startup consumes reconciliation capacity |
+| Raw-envelope reservation | 65,536 bytes each; 4,194,304 bytes aggregate; errors retain typed origin/stable code rather than subprocess output |
+| Request lifetime / stop budget | At most 35,000 ms including queueing; stop can return explicitly unresolved jobs |
+| Result retention | Finite slot count until explicit take or stop; not a current-value cache, history window or freshness promise |
+| Observation spool / runtime pins | 0 bytes / 0 pins admitted; later PR03 owns those contracts |
+
+The derivation stays below `StoreBounds::tiny`'s 64 tasks/16 operations and
+`NativeBounds::local`'s 8 admissions. Existing owner limits remain unchanged:
+SQLite WAL/FULL, 5,000 ms busy wait, 35,000 ms operation budget and 8,388,608-byte
+retained-journal setting; native maintenance's 1,048,576-byte working and
+1,048,576-byte future-journal reserves; seal's 32 live seals, 256 history rows,
+64 closure nodes, depth 16, 262,144 closure bytes, 8 native refs and 2,097,152 bytes
+per artifact. API pages/work stay 64/256 and review/publish ceilings stay 1/2.
+These are not host-global memory/disk quotas or hard live-WAL limits. Other
+independent owners are not silently covered by this runtime's accounting.
+
+Accepted revision, active generation, runtime incarnation and source generation
+remain distinct. Content, authority and generation are rechecked at handoff;
+superseded callbacks are refused. Checks are last-read evidence, not a lease or
+cross-process fence. No SQL transaction or native/registry guard spans the inert
+adapter call. Stop closes intake and joins actual jobs, or returns `Unresolved`
+while retaining their reservations. Keep that owner and poll/stop again; dropping
+it reports abandoned work as unresolved and does **not** assert a successful join.
+`Stopped` refers to runtime jobs, not closing the retained stores or proving all
+Selene-internal shutdown work finished. No real-time scheduling guarantee is made.
+
+[`tests/runtime_owner.rs`](tests/runtime_owner.rs) selects B03 A01–A10 against
+isolated synthetic stores. Real-source semantics (F02/E05), non-fixture access
+(E06), approved peer traffic (E03), and facility action choices D06/D07 remain
+unresolved at their consumers. The observed `bacnet-client`/Tokio and
+`apdu_retries(0)` preparation is recorded as **pending PR01B input only** in
+[`inert.rs`](src/runtime/inert.rs); no dependency was adopted or wire behavior
+qualified here.
 
 ## Merged repair evidence (R01–R07 and PR19)
 

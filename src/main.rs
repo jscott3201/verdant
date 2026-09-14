@@ -33,6 +33,7 @@ mod binding;
 mod seal;
 mod accept;
 mod api;
+mod runtime;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
@@ -66,6 +67,7 @@ fn usage() -> String {
          \x20 verdant health [--config PATH] [--verbose]\n\
          \x20 verdant run --config PATH [--once] [--max-seconds N]\n\
          \x20 verdant evidence\n\
+         \x20 verdant capabilities\n\
          \x20 verdant (draft|edit|validate|seal|accept|status|read|recovery) OPTIONS\n\
          \x20 verdant (-h|--help) | (-V|--version)\n\
          \n\
@@ -127,6 +129,7 @@ fn main() -> ExitCode {
         "health" => cmd_health(&args[1..]),
         "run" => cmd_run(&args[1..]),
         "evidence" => cmd_evidence(&args[1..]),
+        "capabilities" => runtime::inventory::command(&args[1..]),
         "draft" | "edit" | "validate" | "seal" | "accept" | "status" | "read" | "recovery" =>
             cmd_setup(&args[0], &args[1..]),
         other => {
