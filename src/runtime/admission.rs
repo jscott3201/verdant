@@ -40,6 +40,15 @@ pub const MAX_ENVELOPE_BYTES: usize = 65_536;
 pub const MAX_RETAINED_BYTES: usize = 64 * MAX_ENVELOPE_BYTES;
 pub const MAX_LIFETIME: Duration = Duration::from_millis(35_000);
 pub const MAX_DRAIN: Duration = Duration::from_millis(35_000);
+// PR01B extends THIS runtime family, not an independent acquisition semaphore.
+// One configured fake peer: 8 scripts x 4 replies x 1024 bytes = 32768 bytes;
+// 8 captured requests x 1024 = 8192 bytes. Up to 4 active slots x 4 replies x
+// 1024 = 16384 bytes in transit. Total scripted/captured/in-flight payload bound
+// is 57344 bytes, separate from the 4 MiB envelope reservation. This is NOT an
+// allocator/RSS limit (upstream fixed queues and executor overhead are excluded).
+// Each quarantined device consumes one of the SAME 60 optional retained slots;
+// max 16 candidates x 4 inspectable advertisements, with explicit discard.
+pub const BACNET_FAKE_PAYLOAD_BYTES: usize = 57_344;
 // No durable observation spool/pins in this slice: zero admitted bytes/pins.
 // Existing seal custody stays seal-owned (32 live, 256 history, 64 nodes,
 // depth 16, 262144 closure bytes, 8 native refs, 2097152 bytes/artifact).
