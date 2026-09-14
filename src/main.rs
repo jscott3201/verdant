@@ -34,6 +34,7 @@ mod seal;
 mod accept;
 mod api;
 mod runtime;
+mod observation;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
