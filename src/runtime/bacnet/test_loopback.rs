@@ -1,4 +1,4 @@
-//! Test-only reusable UDP/BVLC envelope harness, deliberately COV-agnostic.
+//! Test-only reusable capture log and UDP/BVLC harness, deliberately COV-agnostic.
 //! All binds use 127.0.0.1:0. Independent peer responses belong to the caller.
 //! PacketLog captures every send/receive at BOTH socket boundaries; not a pcap
 //! or evidence about uninstrumented traffic, physical interfaces, or real peers.
@@ -25,7 +25,7 @@ const QUEUE: usize = 64;
 // Guard the complete allocate -> stop/join -> rebind interval. Otherwise a
 // concurrent fixture may legitimately acquire a just-released ephemeral port
 // before its previous owner verifies release. Test isolation, not admission.
-static PORT_RELEASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static PORT_RELEASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub sent: bool,
@@ -36,7 +36,7 @@ pub struct Packet {
 #[derive(Clone, Default)]
 pub struct PacketLog(Arc<Mutex<Vec<Packet>>>);
 impl PacketLog {
-    fn record(&self, sent: bool, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
+    pub(crate) fn record(&self, sent: bool, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
         let mut packets = self.0.lock().unwrap();
         assert!(packets.len() < PACKETS, "fixture capture full; never silently truncate");
         assert!(bytes.len() <= BYTES + 4);
@@ -81,6 +81,25 @@ impl PacketLog {
                     .count(),
                 received.iter().filter(|q| q.from == p.from && q.to == p.to && q.bytes == p.bytes).count()
             );
+        }
+    }
+    /// TCP is a byte stream: compare complete directional streams, not syscall
+    /// or IP-packet counts. The caller captures both transport/socket boundaries.
+    /// This is an instrumented fixture audit, NOT host-wide/off-interface pcap.
+    pub(crate) fn assert_tcp_complete(&self, client: SocketAddr, peer: SocketAddr) {
+        self.assert_loopback_only();
+        let packets = self.packets();
+        assert!(!packets.is_empty());
+        for p in &packets {
+            assert!((p.from == client && p.to == peer) || (p.from == peer && p.to == client));
+            assert!((49152..=65535).contains(&p.from.port()));
+            assert!((49152..=65535).contains(&p.to.port()));
+            assert!(![502, 802].contains(&p.from.port()) && ![502, 802].contains(&p.to.port()));
+        }
+        for (from, to) in [(client, peer), (peer, client)] {
+            let stream = |sent| packets.iter().filter(|p| p.sent == sent && p.from == from && p.to == to)
+                .flat_map(|p| p.bytes.iter().copied()).collect::<Vec<_>>();
+            assert_eq!(stream(true), stream(false), "TCP sent != received: {from} -> {to}");
         }
     }
 }

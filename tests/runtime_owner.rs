@@ -18,6 +18,8 @@ mod fixture;
 mod helpers;
 #[path = "../src/native/mod.rs"]
 mod native;
+#[path = "../src/observation/mod.rs"]
+mod observation;
 #[path = "../src/runtime/mod.rs"]
 mod runtime;
 #[path = "../src/seal/mod.rs"]

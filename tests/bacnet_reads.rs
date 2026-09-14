@@ -22,6 +22,8 @@ mod lifecycle;
 mod manifest;
 #[path = "../src/native/mod.rs"]
 mod native;
+#[path = "../src/observation/mod.rs"]
+mod observation;
 #[path = "bacnet_cases/reads.rs"]
 mod reads;
 #[path = "../src/runtime/mod.rs"]
