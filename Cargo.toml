@@ -26,3 +26,14 @@ path = "src/main.rs"
 # (Database::create/open/checkpoint/prune + session execute).
 [dependencies]
 selene-db = { git = "https://github.com/jscott3201/selene-db.git", rev = "b65c2344c916d2c3ceeb72cefcd72e7960e95e25" }
+
+# M02-PR01B closed E01: exactly these five additional direct dependencies.
+# rusty-bacnet 02dd371201cb5d203058e9d0c8076c9ec9127338, default features;
+# ipv6/sc-tls remain OFF. Public read codecs/client plus socket-free TransportPort
+# fixtures only; no live transport construction. Tokio is adapter-confined.
+# Zero APDU retries are configured, but zero-retry wire semantics are UNVERIFIED.
+bacnet-client = { git = "https://github.com/jscott3201/rusty-bacnet", rev = "02dd371201cb5d203058e9d0c8076c9ec9127338" }
+bacnet-types = { git = "https://github.com/jscott3201/rusty-bacnet", rev = "02dd371201cb5d203058e9d0c8076c9ec9127338" }
+bacnet-services = { git = "https://github.com/jscott3201/rusty-bacnet", rev = "02dd371201cb5d203058e9d0c8076c9ec9127338" }
+bacnet-transport = { git = "https://github.com/jscott3201/rusty-bacnet", rev = "02dd371201cb5d203058e9d0c8076c9ec9127338" }
+tokio = { version = "1", features = ["net", "rt", "sync", "macros", "time"] }

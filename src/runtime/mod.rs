@@ -18,9 +18,11 @@
 #![allow(unused_imports)]
 
 pub mod admission;
+pub mod bacnet;
 mod inert;
 pub mod inventory;
 mod owners;
+mod plug;
 mod task;
 use crate::{
     access::Credential,
@@ -98,6 +100,7 @@ struct Queued {
     key: String,
     deadline: Instant,
     reserved: Arc<Reservation>,
+    admitted: Option<bacnet::BindingPlan>,
 }
 enum Output {
     Started(Arc<Owners>, Result<Selection>, Credential, SourceGeneration),
@@ -130,7 +133,7 @@ pub struct Runtime {
     state: State,
     last_error: Option<&'static str>,
     budget: Arc<Budget>,
-    adapter: inert::InertAdapter,
+    adapter: plug::Adapter,
     queue: VecDeque<Queued>,
     running: Vec<Running>,
     completed: VecDeque<Completed>,
@@ -152,7 +155,7 @@ impl Default for Runtime {
             state: State::Disabled,
             last_error: None,
             budget: Arc::new(Budget::default()),
-            adapter: inert::InertAdapter::default(),
+            adapter: plug::Adapter::default(),
             queue: VecDeque::new(),
             running: Vec::new(),
             completed: VecDeque::new(),
@@ -229,10 +232,11 @@ impl Runtime {
         {
             return Err(Error::Invalid("inert sensing requires structurally valid sense binding"));
         }
+        let admitted = self.adapter.admit(&session.selected, key, class)?;
         let reserved = self.budget.reserve(class, false)?;
         self.sequence = self.sequence.checked_add(1).ok_or(Error::Invalid("work identity exhausted"))?;
         let id = WorkId { incarnation: session.incarnation, sequence: self.sequence };
-        self.queue.push_back(Queued { id, class, key: key.into(), deadline, reserved });
+        self.queue.push_back(Queued { id, class, key: key.into(), deadline, reserved, admitted });
         Ok(id)
     }
     /// Dispatch at most one queued item. Mandatory classes precede optional work;
@@ -263,7 +267,7 @@ impl Runtime {
         let session = self.session.clone().ok_or(Error::NotRunning)?;
         let adapter = self.adapter.clone();
         let queued = self.queue.remove(index).ok_or(Error::Invalid("queue index"))?;
-        let Queued { id, key, deadline, reserved, .. } = queued;
+        let Queued { id, key, deadline, reserved, admitted, .. } = queued;
         #[cfg(test)]
         let before_handoff = self.before_handoff.take();
         #[cfg(test)]
@@ -278,13 +282,17 @@ impl Runtime {
             owners.check_generation(&session.selected, &session.credential)?;
             cancel.check(deadline)?;
             // NO SQL transaction, registry/native/custody guard here.
-            let raw = adapter.read(&session.selected, &key, id, session.incarnation, session.source)?;
+            let raw = adapter.read(plug::Context {
+                selected: &session.selected, key: &key, work: id,
+                incarnation: session.incarnation, source: session.source,
+            }, admitted, &cancel, deadline)?;
             #[cfg(test)]
             if let Some(hook) = before_callback {
                 hook();
             }
             owners.check_generation(&session.selected, &session.credential)?;
             cancel.check(deadline)?;
+            adapter.retain_candidates(&raw)?;
             Ok(Output::Read(raw))
         });
         match task {
@@ -509,6 +517,7 @@ pub enum Error {
     Seal(&'static str),
     Storage(&'static str),
     Native(&'static str),
+    Bacnet(&'static str),
     Io(Option<i32>),
 }
 impl Error {
@@ -532,6 +541,7 @@ impl Error {
             | Self::Api(code)
             | Self::Seal(code)
             | Self::Storage(code)
+            | Self::Bacnet(code)
             | Self::Native(code) => code,
             Self::Io(_) => "runtime-io",
         }

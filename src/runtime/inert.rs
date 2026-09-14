@@ -23,10 +23,15 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptOrigin {
     InertAdapterReturn,
+    /// Response-correlated public-client completion, NOT socket ingress.
+    BacnetClientReturn,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawOutcome {
     NotAttemptedInert,
+    Bacnet(super::bacnet::ReadBatch),
+    Quarantined(Vec<super::bacnet::Advertisement>),
+    DiscoveryRefused,
 }
 
 /// PR01A raw-envelope shape: identities and timestamp origins, not a normalized
