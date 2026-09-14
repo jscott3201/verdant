@@ -6,7 +6,7 @@
 //! E01 preserves Rust/Cargo 1.97.1, Selene b65c2344/default features, system
 //! sqlite3 and /usr/bin/shasum. Fixture target: macOS/arm64/debug only. E02's
 //! numeric local assumptions/enforcement are in admission, not facility D06/D07.
-//! No E03 traffic, E05 real-source claims or E06 non-fixture authentication.
+//! PR02 adds test-only E03 loopback; no E05 or E06 non-fixture qualification.
 //!
 //! Call begin_start -> poll until RunningInert/refusal. Queue explicit read keys
 //! from that exact selection, then dispatch_next. Each dispatch rechecks content,
@@ -137,6 +137,7 @@ pub struct Runtime {
     queue: VecDeque<Queued>,
     running: Vec<Running>,
     completed: VecDeque<Completed>,
+    cov_slots: Vec<Arc<bacnet::cov_admission::Slot>>,
     #[cfg(test)]
     pub(crate) before_handoff: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -159,6 +160,7 @@ impl Default for Runtime {
             queue: VecDeque::new(),
             running: Vec::new(),
             completed: VecDeque::new(),
+            cov_slots: Vec::new(),
             #[cfg(test)]
             before_handoff: None,
             #[cfg(test)]
@@ -316,6 +318,7 @@ impl Runtime {
         Err(Error::Invalid("unknown live work"))
     }
     pub fn poll(&mut self) {
+        self.cov_slots.retain(|slot| !slot.joined());
         let mut index = 0;
         while index < self.running.len() {
             if Instant::now() >= self.running[index].deadline {
@@ -400,7 +403,9 @@ impl Runtime {
                 (None, Ok(Output::Native)) => {}
             }
         }
-        if matches!(self.state, State::Stopping | State::Unresolved) && self.running.is_empty() {
+        if matches!(self.state, State::Stopping | State::Unresolved)
+            && self.running.is_empty() && self.cov_slots.is_empty()
+        {
             self.state = State::Stopped;
         }
     }
@@ -419,19 +424,22 @@ impl Runtime {
         self.queue.clear();
         self.completed.clear();
         self.session = None;
+        for slot in &self.cov_slots {
+            slot.cancel();
+        }
         for job in &self.running {
             job.task.cancel.cancel();
         }
         let deadline = Instant::now() + budget;
         loop {
             self.poll();
-            if self.running.is_empty() {
+            if self.running.is_empty() && self.cov_slots.is_empty() {
                 self.state = State::Stopped;
                 return Ok(Drain::Stopped);
             }
             if Instant::now() >= deadline {
                 self.state = State::Unresolved;
-                return Ok(Drain::Unresolved { jobs: self.running.len() });
+                return Ok(Drain::Unresolved { jobs: self.running.len() + self.cov_slots.len() });
             }
             std::thread::sleep(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
         }
@@ -486,6 +494,9 @@ impl Runtime {
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
+        for slot in &self.cov_slots {
+            slot.cancel();
+        }
         for job in &self.running {
             job.task.cancel.cancel();
         }
