@@ -1,10 +1,16 @@
-//! M02-PR01B, socket-free acquisition support, not a live BACnet service.
-//! Live loopback peer tests are DEFERRED: upstream loopback-bind support or a
-//! fresh E03 amendment is required. Zero-retry wire semantics remain UNVERIFIED.
-//! Exact dependency profile, E02 assumptions and B01–B12 manifest: CONTRACT.md.
+//! PR01B reads remain socket-free; PR02 adds a finite direct COV owner and
+//! test-only loopback peers under the 2026-09-14 E03 amendment. No CLI activation.
+//! Inherited zero-retry failure-path wire semantics remain unqualified.
+//! PR01B dependency profile, E02 assumptions and B01–B12 manifest: CONTRACT.md.
 #[cfg(test)]
 mod bounds_tests;
 mod client;
+pub(crate) mod cov;
+pub(crate) mod cov_admission;
+#[cfg(test)]
+mod cov_tests;
+#[cfg(test)]
+pub(crate) mod test_loopback;
 pub mod fake;
 mod model;
 pub mod poll;
