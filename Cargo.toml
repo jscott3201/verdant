@@ -36,4 +36,17 @@ bacnet-client = { git = "https://github.com/jscott3201/rusty-bacnet", rev = "02d
 bacnet-types = { git = "https://github.com/jscott3201/rusty-bacnet", rev = "02dd371201cb5d203058e9d0c8076c9ec9127338" }
 bacnet-services = { git = "https://github.com/jscott3201/rusty-bacnet", rev = "02dd371201cb5d203058e9d0c8076c9ec9127338" }
 bacnet-transport = { git = "https://github.com/jscott3201/rusty-bacnet", rev = "02dd371201cb5d203058e9d0c8076c9ec9127338" }
-tokio = { version = "1", features = ["net", "rt", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "macros", "time", "io-util"] }
+
+# M02-PR04 D02/E01 amendment (2026-09-14): exactly these five 0.1.1
+# packages at 70c8e50ab08ad039513a437f0fa328bf5974b57c, default features.
+# Read-only public client/codec/TCP profile; tls/server/gateway/pool/rtu/
+# rtu-serial/full/cli/sim/conformance/python are not selected. Upstream floor
+# 1.95 is below our unchanged 1.97.1 pin. Tokio io-util adds only the bounded
+# test peer's TCP byte I/O; Tokio remains adapter-confined. Zero retries are
+# configured, NOT a qualified wire-single-packet guarantee.
+rusty-modbus-client = { git = "https://github.com/jscott3201/rusty-modbus", rev = "70c8e50ab08ad039513a437f0fa328bf5974b57c" }
+rusty-modbus-types = { git = "https://github.com/jscott3201/rusty-modbus", rev = "70c8e50ab08ad039513a437f0fa328bf5974b57c" }
+rusty-modbus-codec = { git = "https://github.com/jscott3201/rusty-modbus", rev = "70c8e50ab08ad039513a437f0fa328bf5974b57c" }
+rusty-modbus-frame = { git = "https://github.com/jscott3201/rusty-modbus", rev = "70c8e50ab08ad039513a437f0fa328bf5974b57c" }
+rusty-modbus-tcp = { git = "https://github.com/jscott3201/rusty-modbus", rev = "70c8e50ab08ad039513a437f0fa328bf5974b57c" }

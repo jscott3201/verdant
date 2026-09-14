@@ -21,6 +21,7 @@ pub mod admission;
 pub mod bacnet;
 mod inert;
 pub mod inventory;
+pub(crate) mod modbus;
 mod owners;
 mod plug;
 mod task;
@@ -138,6 +139,7 @@ pub struct Runtime {
     running: Vec<Running>,
     completed: VecDeque<Completed>,
     cov_slots: Vec<Arc<bacnet::cov_admission::Slot>>,
+    modbus_slots: Vec<Arc<modbus::admission::Slot>>,
     #[cfg(test)]
     pub(crate) before_handoff: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -161,6 +163,7 @@ impl Default for Runtime {
             running: Vec::new(),
             completed: VecDeque::new(),
             cov_slots: Vec::new(),
+            modbus_slots: Vec::new(),
             #[cfg(test)]
             before_handoff: None,
             #[cfg(test)]
@@ -319,6 +322,7 @@ impl Runtime {
     }
     pub fn poll(&mut self) {
         self.cov_slots.retain(|slot| !slot.joined());
+        self.modbus_slots.retain(|slot| !slot.joined());
         let mut index = 0;
         while index < self.running.len() {
             if Instant::now() >= self.running[index].deadline {
@@ -404,7 +408,7 @@ impl Runtime {
             }
         }
         if matches!(self.state, State::Stopping | State::Unresolved)
-            && self.running.is_empty() && self.cov_slots.is_empty()
+            && self.running.is_empty() && self.cov_slots.is_empty() && self.modbus_slots.is_empty()
         {
             self.state = State::Stopped;
         }
@@ -427,19 +431,22 @@ impl Runtime {
         for slot in &self.cov_slots {
             slot.cancel();
         }
+        for slot in &self.modbus_slots {
+            slot.cancel();
+        }
         for job in &self.running {
             job.task.cancel.cancel();
         }
         let deadline = Instant::now() + budget;
         loop {
             self.poll();
-            if self.running.is_empty() && self.cov_slots.is_empty() {
+            if self.running.is_empty() && self.cov_slots.is_empty() && self.modbus_slots.is_empty() {
                 self.state = State::Stopped;
                 return Ok(Drain::Stopped);
             }
             if Instant::now() >= deadline {
                 self.state = State::Unresolved;
-                return Ok(Drain::Unresolved { jobs: self.running.len() + self.cov_slots.len() });
+                return Ok(Drain::Unresolved { jobs: self.running.len() + self.cov_slots.len() + self.modbus_slots.len() });
             }
             std::thread::sleep(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
         }
@@ -495,6 +502,9 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         for slot in &self.cov_slots {
+            slot.cancel();
+        }
+        for slot in &self.modbus_slots {
             slot.cancel();
         }
         for job in &self.running {
