@@ -149,7 +149,7 @@ impl Inventory {
         assert_eq!(semantics::profile::PINNED_PROFILE_ID, PROFILE);
         assert_eq!(storage::SCHEMA_GENERATION, 1);
         assert_eq!(query(root, "SELECT generation,applied_note FROM schema_migrations ORDER BY generation;"),
-            "1|M01-PR03 0001_init: initial tiny outbox\n2|R03 0002_receipts: admission and reconciliation\n");
+            "1|M01-PR03 0001_init: initial tiny outbox\n2|R03 0002_receipts: admission and reconciliation\n3|M02-PR03B 0003_observations: finite window and custody\n");
         assert_eq!(query(root, "PRAGMA user_version;"), "1\n");
         // Source identities/toolchain/target stay exact. Host tool versions have
         // floors (SQLite 3.50.0 within major 3; shasum 6.0), not local equality.
@@ -172,7 +172,7 @@ impl Inventory {
         let binary = format!("m01-gate-verdant-sha256-{binary_digest}");
         let host = "m01-gate-macos-arm64-debug".into();
         let mut text = format!(
-            "head={head}\nbase={BASE}\nsource_state={}rust={rust}cargo={cargo}target=aarch64-apple-darwin\nprofile=debug\nsqlite3={sqlite}shasum={shasum}selene={SELENE}\nmigrations=0001_init,0002_receipts\nprofile_id={PROFILE}\nconverter={CONVERTER}\nbinary_sha256={binary_digest}\n",
+            "head={head}\nbase={BASE}\nsource_state={}rust={rust}cargo={cargo}target=aarch64-apple-darwin\nprofile=debug\nsqlite3={sqlite}shasum={shasum}selene={SELENE}\nmigrations=0001_init,0002_receipts,0003_observations\nprofile_id={PROFILE}\nconverter={CONVERTER}\nbinary_sha256={binary_digest}\n",
             run("git", &["status", "--porcelain", "--untracked-files=all"]),
         );
         text.push_str(&format!("sqlite3_executable={}\nshasum_executable={}\nseal_hash_tool={hash_tool}\n",
@@ -181,7 +181,7 @@ impl Inventory {
         // system executables are measurements, not portable OS image pins.
         for file in OWNED.iter().copied().chain([
             "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
-            "migrations/sqlite/0001_init.sql", "migrations/sqlite/0002_receipts.sql",
+            "migrations/sqlite/0001_init.sql", "migrations/sqlite/0002_receipts.sql", "migrations/sqlite/0003_observations.sql",
         ]) {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
             if OWNED.contains(&file) {

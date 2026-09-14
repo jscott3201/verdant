@@ -148,7 +148,7 @@ fn fixed_two_initializers_publish_one_complete_store() {
         committed(right.submit(&pending(&right, 2)));
     });
     assert_eq!(counts(&scratch.db()), "2|1|2");
-    assert_eq!(raw(&scratch.db(), "SELECT group_concat(generation) FROM schema_migrations; SELECT count(*) FROM storage_identity;"), "1,2\n1");
+    assert_eq!(raw(&scratch.db(), "SELECT group_concat(generation) FROM schema_migrations; SELECT count(*) FROM storage_identity;"), "1,2,3\n1");
     let mut names = std::fs::read_dir(&scratch.0).expect("no private leftovers")
         .map(|entry| {
             let entry = entry.expect("directory entry");
@@ -245,7 +245,7 @@ fn migration_0001_upgrade_backfills_duplicates_without_touching_history() {
 
 #[test]
 fn downgrade_unknown_ledger_and_replaced_identity_are_refused() {
-    for sql in ["DELETE FROM schema_migrations WHERE generation=2;", "INSERT INTO schema_migrations VALUES(3,'unknown');", "PRAGMA application_id=0;", "UPDATE storage_identity SET identity='bad';"] {
+    for sql in ["DELETE FROM schema_migrations WHERE generation=2;", "INSERT INTO schema_migrations VALUES(4,'unknown');", "PRAGMA application_id=0;", "UPDATE storage_identity SET identity='bad';"] {
         let scratch = Scratch::new();
         let store = scratch.open();
         raw(&scratch.db(), sql);
