@@ -8,6 +8,10 @@ pub mod identity;
 pub mod index;
 pub mod normalize;
 pub mod time;
+pub(crate) mod window;
+pub(crate) mod spool;
+pub(crate) mod pins;
+pub(crate) mod custody;
 
 use crate::{
     accept::{AcceptedRevision, ActiveGeneration, EffectiveConfig},

@@ -385,7 +385,7 @@ fn findings_carry_stable_id_and_generation_for_pr11() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn migration_0002_receipts_coexist_with_generation_1_consumers() {
+fn migration_0002_0003_coexist_with_generation_1_consumers() {
     let scratch = Scratch::new("migration");
     let (_gate, _creds) = open_gate(&scratch, "mig.db");
     let mut registry = open_registry(&scratch, "mig.db");
@@ -397,7 +397,7 @@ fn migration_0002_receipts_coexist_with_generation_1_consumers() {
         migrations.push(entry.file_name().to_string_lossy().into_owned());
     }
     migrations.sort();
-    assert_eq!(migrations, vec!["0001_init.sql", "0002_receipts.sql"]);
+    assert_eq!(migrations, vec!["0001_init.sql", "0002_receipts.sql", "0003_observations.sql"]);
     assert_eq!(storage::SCHEMA_GENERATION, 1);
     assert_eq!(binding::registry::BINDING_SCHEMA_GENERATION, 1);
     // Binding rows coexist with access rows in the same outbox.

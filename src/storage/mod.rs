@@ -41,6 +41,9 @@ use std::fmt;
 use std::sync::mpsc;
 
 pub mod sqlite;
+// Store-facing projection only: no dependency on access/runtime/normalization.
+// The source-inclusion storage harnesses retain their existing boundaries.
+pub(crate) mod observation_writer;
 
 /// Schema generation bound to every prepared statement in this slice.
 ///
@@ -118,6 +121,21 @@ pub const MIGRATION_0002: MigrationRecord = MigrationRecord {
     interruption: "atomic upgrade rollback; unpublished bootstrap files are never adopted; ambiguous commits require same-identity reconciliation",
     read_write_policy: "user_version stays 1; ledger revision 2 plus application_id and store identity enforced in the owning connection",
     rollback_boundary: "no downgrade; unknown/incomplete ledger, objects or identity refused without repair",
+};
+
+pub const MIGRATION_0003_SQL: &str = include_str!("../../migrations/sqlite/0003_observations.sql");
+pub const MIGRATION_0003: MigrationRecord = MigrationRecord {
+    backend: "sqlite",
+    owner: "M02-PR03B",
+    id: "0003_observations",
+    predecessors: &["0002_receipts"],
+    fresh_install: "0001 plus 0002 plus 0003 in one private transaction before publication",
+    supported_upgrade: "validated 0002 to 0003; 0001 first applies 0002; no content backfill",
+    queued_msg_compat: "outbox and other owners' receipts unchanged; three separate observation tables",
+    lock_space: "BEGIN IMMEDIATE; WAL/FULL; fixture-assumption finite logical window, not a WAL quota",
+    interruption: "atomic migration rollback; capture tickets retain UNKNOWN until reconciliation",
+    read_write_policy: "user_version stays 1; exact ledger revision 3 and application/store identity",
+    rollback_boundary: "no downgrade or rewrite; unknown schema/ledger refused without repair",
 };
 
 /// Per-connection durability settings. Recorded on every connection and
