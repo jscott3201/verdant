@@ -1,4 +1,4 @@
-//! B03 B01–B12: socket-free public client and scripted replies only.
+//! B03 B01–B12 plus E03 test-only live loopback read/discovery captures.
 #![allow(dead_code)]
 #[path = "../src/accept/mod.rs"]
 mod accept;
@@ -18,6 +18,12 @@ mod fixture;
 mod helpers;
 #[path = "bacnet_cases/lifecycle.rs"]
 mod lifecycle;
+#[path = "bacnet_cases/live_support.rs"]
+mod live_support;
+#[path = "bacnet_cases/live_reads.rs"]
+mod live_reads;
+#[path = "bacnet_cases/live_limits.rs"]
+mod live_limits;
 #[path = "bacnet_cases/manifest.rs"]
 mod manifest;
 #[path = "../src/native/mod.rs"]

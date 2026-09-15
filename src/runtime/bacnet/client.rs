@@ -8,15 +8,26 @@ use super::{
 use crate::runtime::{task::Cancellation, RawOutcome};
 use bacnet_client::client::{BACnetClient, ClientConfig};
 use bacnet_services::{common::PropertyReference, rpm::ReadAccessSpecification};
+use bacnet_transport::port::TransportPort;
 use bacnet_types::{enums::PropertyIdentifier, error::Error as WireError};
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
-pub(super) struct ReadClient(BACnetClient<FakePort>);
-impl ReadClient {
-    async fn start(port: FakePort) -> Result<Self> {
+// Private static-dispatch seam: FakePort is the sole non-test implementation.
+// No public transport injection, client getter or mutable retry configuration.
+pub(super) trait ReadPort: TransportPort {
+    fn delivery(&self) -> Arc<Mutex<Delivery>>;
+}
+impl ReadPort for FakePort {
+    fn delivery(&self) -> Arc<Mutex<Delivery>> {
+        self.delivery.clone()
+    }
+}
+struct ReadClient<P: ReadPort>(BACnetClient<P>);
+impl<P: ReadPort + 'static> ReadClient<P> {
+    async fn start(port: P) -> Result<Self> {
         let config = ClientConfig {
             apdu_timeout_ms: APDU_TIMEOUT_MS,
             apdu_retries: APDU_RETRIES,
@@ -24,8 +35,8 @@ impl ReadClient {
             segmented_response_accepted: false,
             ..ClientConfig::default()
         };
-        // Generic startup consumes only our private socket-free port. It never
-        // invokes the upstream IP-specific builder or constructs a live transport.
+        // Never invokes the upstream IP-specific builder. Live ports are cfg(test)
+        // only; ordinary builds still consume only the private socket-free port.
         BACnetClient::start(config, port).await.map(Self).map_err(|_| Error::ClientStart)
     }
     async fn read(&self, plan: &BindingPlan) -> RawOutcome {
@@ -147,14 +158,14 @@ fn wire_error(error: WireError) -> PropertyOutcome {
     }
 }
 
-pub(super) async fn execute(
-    port: FakePort,
+pub(super) async fn execute<P: ReadPort + 'static>(
+    port: P,
     plan: &BindingPlan,
     cancel: &Cancellation,
     deadline: Instant,
 ) -> crate::runtime::Result<(RawOutcome, Receipt)> {
     cancel.check(deadline)?;
-    let delivery: Arc<Mutex<Delivery>> = port.delivery.clone();
+    let delivery = port.delivery();
     let mut client = ReadClient::start(port).await?;
     // The absolute PR01A lifetime includes queue/content verification. Canceling
     // the read future is followed by the real client's stop/dispatch joins.

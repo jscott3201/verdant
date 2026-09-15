@@ -1,10 +1,12 @@
-//! PR01B reads remain socket-free; PR02 adds a finite direct COV owner and
-//! test-only loopback peers under the 2026-09-14 E03 amendment. No CLI activation.
-//! Inherited zero-retry failure-path wire semantics remain unqualified.
+//! PR01B includes test-only live reads/discovery under the 2026-09-14 E03 amendment.
+//! Ordinary reads remain socket-free. No CLI activation or facility qualification.
+//! Read single-packet fixture evidence does not extend the inherited COV wire claim.
 //! PR01B dependency profile, E02 assumptions and B01–B12 manifest: CONTRACT.md.
 #[cfg(test)]
 mod bounds_tests;
 mod client;
+#[cfg(test)]
+pub(crate) mod live_fixture;
 pub(crate) mod cov;
 pub(crate) mod cov_admission;
 #[cfg(test)]
@@ -80,6 +82,8 @@ pub(super) struct Adapter {
     peer: fake::ScriptedPeer,
     executor: Arc<tokio::runtime::Runtime>,
     quarantine: Arc<Mutex<quarantine::Quarantine>>,
+    #[cfg(test)]
+    live: Option<live_fixture::Fixture>,
 }
 impl Adapter {
     pub fn new(profile: Profile, peer: fake::ScriptedPeer, budget: Arc<Budget>) -> Result<Self> {
@@ -94,6 +98,8 @@ impl Adapter {
             peer,
             executor: Arc::new(executor),
             quarantine: Arc::new(Mutex::new(quarantine::Quarantine::new(budget))),
+            #[cfg(test)]
+            live: None,
         })
     }
     pub fn admit(&self, selected: &Selection, key: &str, class: WorkClass) -> Result<BindingPlan> {
@@ -130,14 +136,7 @@ impl Adapter {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> crate::runtime::Result<RawEnvelope> {
-        let port = fake::FakePort::new(
-            self.peer.clone(),
-            plan.target.clone(),
-            plan.request.service(),
-            self.profile.destinations.clone(),
-            (cancel.clone(), deadline),
-        );
-        let (outcome, receipt) = self.executor.block_on(client::execute(port, &plan, cancel, deadline))?;
+        let (outcome, receipt) = self.execute(&plan, cancel, deadline)?;
         let raw = RawEnvelope {
             work: context.work,
             scope: context.selected.config.scope().clone(),
@@ -157,6 +156,26 @@ impl Adapter {
         };
         check_envelope(&raw)?;
         Ok(raw)
+    }
+    fn execute(
+        &self,
+        plan: &BindingPlan,
+        cancel: &Cancellation,
+        deadline: Instant,
+    ) -> crate::runtime::Result<(RawOutcome, fake::Receipt)> {
+        #[cfg(test)]
+        if let Some(fixture) = &self.live {
+            let port = fixture.port(plan, cancel.clone(), deadline)?;
+            return self.executor.block_on(client::execute(port, plan, cancel, deadline));
+        }
+        let port = fake::FakePort::new(
+            self.peer.clone(),
+            plan.target.clone(),
+            plan.request.service(),
+            self.profile.destinations.clone(),
+            (cancel.clone(), deadline),
+        );
+        self.executor.block_on(client::execute(port, plan, cancel, deadline))
     }
     pub fn retain_candidates(&self, raw: &RawEnvelope) -> Result<()> {
         if let RawOutcome::Quarantined(advertisements) = &raw.outcome {

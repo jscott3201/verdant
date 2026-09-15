@@ -1,32 +1,50 @@
-# M02-PR01B socket-free contract and evidence manifest
+# M02-PR01B read contract and evidence manifest
 
 Integration owner: Muse Spark contributor orchestrator. Implementation: Astra.
 Independent peer/decoder review belongs to the orchestrator's review lane.
-This is compiled socket-free support behind the PR01A handoff, not a configured
-CLI service, commissioned binding, observed qualification, or parent PR01 closure.
+This is compiled socket-free support plus test-only live loopback evidence behind
+the PR01A handoff, not a configured CLI service, commissioned binding, observed
+qualification, or parent PR01 closure.
 
 ## E01, E03 and residuals
 
 Exactly five added direct dependencies: bacnet-client, bacnet-types,
 bacnet-services and bacnet-transport at rusty-bacnet
 `02dd371201cb5d203058e9d0c8076c9ec9127338`, default features (ipv6/sc-tls OFF),
-plus crates.io tokio 1 with net/rt/sync/macros/time only. The lockfile selects
+plus crates.io tokio 1 with net/rt/sync/macros/time (and PR04's inherited io-util).
+This live slice changes no dependencies, features or pins. The lockfile selects
 Tokio 1.53.1 and the BACnet crates 0.11.0. Existing Selene and compiler pins stay
 unchanged: Selene `b65c2344c916d2c3ceeb72cefcd72e7960e95e25`, Rust/Cargo 1.97.1.
 Validation target/profile: macOS / aarch64-apple-darwin / debug only.
 The new transitive packages are lockfile dependencies, not additional direct APIs.
 The development revision may drift upstream: every pin change needs revalidation.
 
-Live loopback peer tests: DEFERRED pending upstream loopback-bind support or a
-fresh E03 amendment. No socket, live transport construction, listener, packet
-capture or facility traffic is authorized or performed by this fixture profile.
-TransportPort/ReceivedNpdu are used with a private in-memory scripted transport.
-No upstream source is changed.
+Live reads/directed discovery: proven-with-captures in the E03 2026-09-14 amended
+test-only profile. `src/runtime/bacnet/live_fixture.rs` binds exactly two named
+127.0.0.1:0 UDP endpoints per run; their actual macOS ephemeral ports are printed
+by READ-CAPTURE. No wildcard bind is needed. Only directed ReadProperty,
+ReadPropertyMultiple and one-instance WhoIs are emitted. All fixture socket sends
+and receives are captured and paired byte-for-byte, including capture-empty
+refusals. BVLC Original-Unicast-NPDU, length, direct NPDU and service/property/range
+literals are audited (MBAP is Modbus-specific and is not a BACnet header).
+These are instrumented boundary captures, NOT host-wide pcap or proof about
+uninstrumented traffic. No fixture packet is addressed off-loopback. Both tasks
+join, the receive channel reaches observed EOF (UDP itself has no EOF), all socket
+owners release, and both exact ports successfully rebind before the run passes.
+No upstream source, IP-specific transport builder, COV implementation or ordinary
+CLI activation is changed. Non-test builds still use only the in-memory transport.
 
 APDU timeout = 6000 ms; APDU retries = 0, immutable during active work.
-Verdant performs no retries or fallback service requests. Even when the fake
-captures one request, zero-retry wire semantics: UNVERIFIED. This is not proof
-about physical packet counts, transport duplication, live cancellation or peers.
+Verdant performs no retries or fallback service requests.
+Read single-packet emission: proven-with-captures for the selected loopback RP/RPM
+success, per-property/remote error, reject, abort, invalid reply, oversize, silent
+peer TSM expiry and RP cancellation paths. Exactly one client UDP request send and
+one identical peer receive occur per attempted read; denied/queued-expired work
+emits zero. The transport does not suppress duplicate sends to manufacture this
+result. The real 6000 ms TSM expiry is awaited for both RP and RPM, not cut short
+by an accelerated timeout. This is NOT real-network duplication/loss qualification,
+real-device interoperability, or a retry guarantee for other services/transports.
+COV-wire and Modbus-wire retry items remain inherited and unchanged.
 The pinned client's silent-peer TSM expiry returns `Abort(10)` (TSM_TIMEOUT),
 not `Error::Timeout`; this raw reason is retained and does not claim a received
 Abort packet. Its exact source is client/requests.rs:452–463 at the above pin.
@@ -43,14 +61,18 @@ commissioned route or evidence of real MS/TP or semantic onboarding.
 The private fake-send boundary rechecks deadline/cancellation after startup and
 encoding, immediately before capture; refused work does not consume its script.
 
-`src/runtime/bacnet/client.rs` alone owns a private upstream client tuple. Its
+`src/runtime/bacnet/client.rs` alone owns the private upstream read-client tuple. Its
 only request operations are ReadProperty, ReadPropertyMultiple and directed WhoIs
-for one instance. There is no generic callback, transport injection, raw client,
+for one instance. There is no public generic callback, transport injection, raw client,
 Deref, writer, management, COV, file, BBMD or global WhoIs surface. The private
 fake port also gates outgoing request type/destination and never forwards incoming
 requests, routes or segmented frames that could provoke unsolicited responses.
-The fixture performs no new protocol-stack implementation: public service codecs
-and client transaction processing are exercised with constrained direct NPDUs.
+The fixture performs no new product protocol-stack implementation: public service
+codecs and client transaction processing are exercised with constrained direct
+NPDUs. The private static ReadPort seam has only FakePort in non-test builds.
+The test port retains the same destination/service/deadline gate and bounds before
+upstream decode. Directed discovery waits for the bounded scripted reply count;
+this fixture handshake is not a production discovery window or scan algorithm.
 
 One timer-only Tokio executor per configured adapter is driven by the PR01A-owned
 threads. It opens no I/O driver or additional worker thread. Each admitted job
@@ -59,6 +81,9 @@ dispatch and network dispatch, then stops the fake transport. Cancellation drops
 the request future, not the stop future. A held stop retains the actual PR01A
 job, lease and reservations; a bounded controller stop reports Unresolved. Drop
 is not stop evidence. No SQL/native guard spans the client call.
+The live test driver additionally owns an I/O-enabled current-thread reactor for
+its isolated peer sockets; it drives the unchanged PR01A queue/dispatch/result and
+private read client. No I/O driver or socket is added to ordinary adapter startup.
 
 Candidate identity is (realm, device instance); conflicting advertisements stay
 inspectable and cannot produce an accepted binding or plan. Expiry marks the
@@ -96,6 +121,14 @@ settings. `src/runtime/admission.rs` still owns shared admission.
   A stalled scheduler reports missed periods and moves next to now + period;
   no catch-up burst, no automatic runtime ticker, no invented missed samples.
 * Spool/pins remain zero; storage/native/journal reserves are unchanged.
+* Live capture: at most 128 entries of 1029 bytes; receive margin is 1024+1 NPDU
+  bytes solely to prove oversize refusal. Raw/filter queues each hold at most four
+  messages, peer scripts at most eight exchanges/four replies. These test-fixture
+  limits are separate from admission's shared [2,2,60]/[1,1,2] reservations.
+  The 65536/65537 retained-envelope check uses a live-derived envelope with a
+  synthetic enlarged capacity, NOT an impossible 65536-byte UDP payload. Poll
+  phase/stall cases use explicit clock events driving actual reads, not suspend
+  qualification or an operational ticker. Socket rebind has a 5s failure budget.
 
 ## Parent source/case/evidence manifest
 
@@ -124,8 +157,30 @@ round trips. Full-case execution is evidenced by test output, not this name map.
 | B09 | manifest::b09_only_read_and_directed_discovery_bytes_reach_fake_port |
 | B10 | lifecycle::b10_cancel_during_read_retains_owner_until_actual_stop_join; lifecycle::b10_superseded_callback_is_not_delivered; lifecycle::b10_public_client_timeout_is_an_outcome_not_a_retry_policy_claim |
 | B11 | reads::b11_receipt_origin_explicit_source_time_absent |
-| B12 | manifest::b12_parent_source_case_evidence_manifest_is_complete_with_live_deferral |
+| B12 | manifest::b12_parent_source_case_evidence_manifest_has_live_captures_and_remaining_deferrals |
 
-All live peers/decoder captures remain deferred; this manifest does not complete
-the original parent live-peer acceptance. F02, COV, Modbus, writer chain, UI/hub/MCP,
-migrations, real credentials, facility values and field qualification are excluded.
+The same integration binary additionally runs the following live rows. Every
+Case::finish emits its endpoint pair, exact request count, sent/received counts,
+start/stop/channel-EOF/rebind audit; refusal rows explicitly assert capture-empty.
+`tests/bacnet_cases/live_support.rs` drives the real runtime owner. Independent
+literals are in unchanged support.rs plus live_reads.rs/live_limits.rs, not client
+encoder output. Source/case maps alone are not execution evidence.
+
+| Live coverage | Executable case | READ-CAPTURE subcases |
+| --- | --- | --- |
+| B01/B11-live | live_reads::live_b01_b11_read_variants_and_receipt | rp-scalar; rp-array-count; rp-array-element; rp-false |
+| B02/B09-live | live_reads::live_b02_b09_destination_service_and_attempted_calls_emit_nothing | denied-destination; denied-service; forbidden-attempts |
+| B03-live | live_reads::live_b03_discovery_realms_conflicts_and_commissioned_freeze | directed-discovery-realm-a; directed-discovery-realm-b; frozen-before-after-live-and-synthetic-adverts; advertised-binding-promotion-refused |
+| B04-live | live_reads::live_b04_rpm_per_property_and_unsupported_outcomes | rpm-per-property-error; rpm-unrecognized-service; rp-unknown-property; rp-unrecognized-service; rp-remote-abort; rp-mismatched-property |
+| B05-live | live_limits::live_b05_queued_deadline_and_cancellation_are_capture_empty | queued-expired-canceled |
+| B06-live | live_limits::live_b06_value_npdu_and_retained_envelope_bounds | value-512; value-513; npdu-1024; npdu-1025 |
+| B07-live | live_limits::live_b07_shared_exhaustion_preserves_mandatory_reserve | shared-exhaustion-mandatory-reads; live-quarantine-shares-budget |
+| B08-live | live_limits::live_b08_startup_missed_poll_no_burst_or_false_samples | poll-startup-stall-no-burst |
+| B10-live | live_limits::live_b10_zero_retry_rp_and_rpm_timeout_and_cancel | rp-timeout; rpm-timeout; rp-canceled-after-emission |
+
+Parent live-peer acceptance remains open: this manifest does not adjudicate full
+original parent closure or independent review. Facility/real-device behavior,
+physical packet behavior outside these instrumented endpoints, and production
+live transport activation remain unproven. COV, Modbus, writer chain, F02,
+UI/hub/MCP, migrations, real credentials, facility values and field qualification
+remain excluded. M03 consumer byte-fit is not established by this read fixture.

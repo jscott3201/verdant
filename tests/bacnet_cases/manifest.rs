@@ -47,11 +47,12 @@ fn b09_only_read_and_directed_discovery_bytes_reach_fake_port() {
     }
     let model = include_str!("../../src/runtime/bacnet/model.rs");
     assert!(model.contains("pub struct Request(Operation)"));
-    assert!(source.contains("struct ReadClient(BACnetClient<FakePort>)"));
+    assert!(source.contains("struct ReadClient<P: ReadPort>(BACnetClient<P>)"));
+    assert!(source.contains("impl ReadPort for FakePort"));
 }
 
 #[test]
-fn b12_parent_source_case_evidence_manifest_is_complete_with_live_deferral() {
+fn b12_parent_source_case_evidence_manifest_has_live_captures_and_remaining_deferrals() {
     let contract = include_str!("../../src/runtime/bacnet/CONTRACT.md");
     let cases =
         [include_str!("reads.rs"), include_str!("lifecycle.rs"), include_str!("manifest.rs")].join("\n");
@@ -68,8 +69,27 @@ fn b12_parent_source_case_evidence_manifest_is_complete_with_live_deferral() {
         assert!(contract.contains(path));
         assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path).is_file());
     }
-    assert!(contract.contains("Live loopback peer tests: DEFERRED"));
-    assert!(contract.contains("zero-retry wire semantics: UNVERIFIED"));
+    assert!(contract.contains("Live reads/directed discovery: proven-with-captures"));
+    assert!(contract.contains("Read single-packet emission: proven-with-captures"));
+    assert!(contract.contains("Parent live-peer acceptance remains open"));
+    assert!(contract.contains("COV-wire and Modbus-wire retry items remain inherited"));
+    let live = [include_str!("live_reads.rs"), include_str!("live_limits.rs")].join("\n");
+    for case in [
+        "live_b01_b11_read_variants_and_receipt",
+        "live_b02_b09_destination_service_and_attempted_calls_emit_nothing",
+        "live_b03_discovery_realms_conflicts_and_commissioned_freeze",
+        "live_b04_rpm_per_property_and_unsupported_outcomes",
+        "live_b05_queued_deadline_and_cancellation_are_capture_empty",
+        "live_b06_value_npdu_and_retained_envelope_bounds",
+        "live_b07_shared_exhaustion_preserves_mandatory_reserve",
+        "live_b08_startup_missed_poll_no_burst_or_false_samples",
+        "live_b10_zero_retry_rp_and_rpm_timeout_and_cancel",
+    ] {
+        assert!(live.contains(&format!("fn {case}(")), "missing executable {case}");
+        assert!(contract.contains(case), "missing live manifest {case}");
+    }
+    let modules = include_str!("../../src/runtime/bacnet/mod.rs");
+    assert!(modules.contains("#[cfg(test)]\npub(crate) mod live_fixture;"));
     assert_eq!((APDU_TIMEOUT_MS, APDU_RETRIES), (6000, 0));
     assert_eq!(admission::QUEUE_SLOTS, [2, 2, 60]);
     assert_eq!(admission::RUNNING_SLOTS, [1, 1, 2]);
