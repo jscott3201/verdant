@@ -1,7 +1,8 @@
 //! M01-PR06 offline vocabulary import and conversion.
 //!
 //! Pinned offline subset plus deterministic supported-subset converter with a
-//! conversion record and manifest. Std-only, zero dependencies, no network,
+//! conversion record and manifest. The legacy converter remains std-only; the
+//! separate S01 parser uses pinned oxttl. No network,
 //! no store writes, no native lifecycle, no field acquisition.
 //!
 //! The pinned profile lives in [`profile`]; the pure converter lives in
@@ -20,3 +21,8 @@
 
 pub mod convert;
 pub mod profile;
+// Integration-owner wiring only: no CLI, conversion, binding or native calls.
+pub mod parse;
+pub mod matrix;
+pub mod ledger;
+pub mod recipe;

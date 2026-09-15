@@ -50,3 +50,7 @@ rusty-modbus-types = { git = "https://github.com/jscott3201/rusty-modbus", rev =
 rusty-modbus-codec = { git = "https://github.com/jscott3201/rusty-modbus", rev = "70c8e50ab08ad039513a437f0fa328bf5974b57c" }
 rusty-modbus-frame = { git = "https://github.com/jscott3201/rusty-modbus", rev = "70c8e50ab08ad039513a437f0fa328bf5974b57c" }
 rusty-modbus-tcp = { git = "https://github.com/jscott3201/rusty-modbus", rev = "70c8e50ab08ad039513a437f0fa328bf5974b57c" }
+
+# F02-S01 D02 ratification: synchronous offline Turtle extraction only.
+# No async-tokio, rdf-12, remote imports, SHACL execution, or native writes.
+oxttl = { version = "=0.2.4", default-features = false }
