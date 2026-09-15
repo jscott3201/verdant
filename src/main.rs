@@ -47,6 +47,9 @@ mod action_dispatch;
 // M02-PR08 normal expiry and exact release (harness-only policy; no CLI change here).
 #[allow(dead_code)]
 mod action_expiry;
+// M02-PR11 uncertain effects and restart recovery (harness-only; no CLI change here).
+#[allow(dead_code)]
+mod action_recovery;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
