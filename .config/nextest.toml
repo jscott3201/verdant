@@ -1,0 +1,9 @@
+[profile.default]
+# Use nextest's default host-CPU parallelism, not a fixed thread count.
+test-threads = "num-cpus"
+# A failed test stays failed; no automatic retries.
+retries = 0
+# Informational slow warnings every 60s only; never terminate a slow test.
+slow-timeout = "60s"
+# Do not cancel remaining tests on the first failure as nextest otherwise does.
+fail-fast = false

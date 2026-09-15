@@ -31,6 +31,12 @@ that command. Consult actual test results and CI selection instead.
 
 - Rust **1.97.1** is pinned by [rust-toolchain.toml](../rust-toolchain.toml);
   all Cargo builds and tests use `--locked`.
+- **cargo-nextest 0.9.143** is the primary test runner, installed in CI via
+  `taiki-e/install-action@v2` with checksums enabled and no install fallback.
+  Locally, if absent: `cargo install cargo-nextest --locked --version 0.9.143`.
+  `cargo nextest run --locked --no-tests=fail` runs the full suite;
+  `cargo test --locked` remains a supported local fallback/sanity path. These
+  are separate runner results. The binary-only crate has no library doctest target.
 - [Cargo.toml](../Cargo.toml) defines one unpublished binary crate and exactly
   one direct dependency: **selene-db 2.0.0-alpha.1**, git revision
   **b65c2344c916d2c3ceeb72cefcd72e7960e95e25**, default features. The source is
@@ -45,18 +51,54 @@ that command. Consult actual test results and CI selection instead.
   cryptographic authentication.
 - Historical local `otool -L target/debug/verdant` output listed
   `libiconv.2.dylib` and `libSystem.B.dylib`, with no SQLite dynamic library;
-  CI records the same kind of check. `otool` alone is not a static-link audit.
+  `otool` is now local macOS validation only. Linux CI uses `ldd`, refuses
+  unresolved libraries, and asserts no SQLite dynamic dependency. Neither
+  command is a static-link audit.
   The process boundary is established by [connection.rs](../src/storage/sqlite/connection.rs)
   and [execution.rs](../src/storage/sqlite/execution.rs).
 
-Only **macOS / arm64 / debug** (`aarch64-apple-darwin`) is evidenced here.
-Release, other targets, and physical-device behavior remain unqualified.
+Historical runs below evidence **macOS / arm64 / debug** (`aarch64-apple-darwin`).
+CI now targets **Linux x86_64 / debug** on `ubuntu-latest`; a green product CI log
+at the delivered head is the Linux proof, not this workflow change or a macOS
+run. macOS remains local/manual validation only. The gate inventory gets the
+exact target from `build.rs`'s Cargo `TARGET` export (`VERDANT_BUILD_TARGET`) and
+uses `m01-gate-{target}-debug` consistently in its inventory and seal assertion.
+Source, executable and seal digests remain measured, not copied from another
+host; all tool floors and the owned-file 700-line check remain in force.
+There is no release tier yet: release, other targets, and physical-device
+behavior remain unqualified. Neither OS lane establishes the other's behavior.
+
+### Linux tool provisioning
+
+Before checkout/toolchain/cache/product steps, CI installs
+`libdigest-sha-perl` with apt for the required `/usr/bin/shasum`. Its actual
+package and tool versions are reported, not OS-image pins; the **6.0** floor
+remains asserted by the gate. Stock Ubuntu SQLite 3.45 is below the unchanged
+**SQLite 3.x ≥3.50.0** floor, so the workflow instead downloads:
+
+- Version: **3.53.4**, Linux x86_64 CLI (upstream archive spelling: `linux-x64`).
+- URL: <https://sqlite.org/2026/sqlite-tools-linux-x64-3530400.zip>
+- Published SHA3SUM / **SHA3-256**:
+  `6eeb57e8f2aef7687f9f016a980992cf2799c8c07a87c5e21495530f91915047`.
+- Checksum source: [SQLite download page](https://sqlite.org/download.html),
+  the Linux tools row (also published as its `PRODUCT` CSV `SHA3-HASH` column).
+  The reviewed value is frozen in the workflow, not scraped from a moving page
+  during CI. This is an archive checksum, not a hash of `sqlite3.c` or a signature.
+
+`openssl dgst -sha3-256` must match before extraction. Only `sqlite3` is extracted
+under `RUNNER_TEMP`, its exact version is asserted, and that directory is
+prepended to `PATH`. The pins step records URL, expected and verified archive
+hash, selected CLI path/version, and measured executable SHA-256. Tools are
+provisioned afresh, not restored from the dependency cache. The archive was
+downloaded and its published hash matched locally; executing that Linux binary
+and apt provisioning on Ubuntu remain CI evidence, not macOS-local evidence.
 
 ## CI evidence policy
 
 [pr01.yml](../.github/workflows/pr01.yml) is the executable check definition:
 
-1. Classify changes: only paths ending in `.md` qualify as docs-only. License,
+1. Provision tools and the pinned rustup toolchain, then classify changes:
+   only paths ending in `.md` qualify as docs-only. License,
    SVG and workflow files select product execution. Empty changes, docs-only
    skip, setup failure, empty tests and product success are distinct outcomes.
 2. Check source-derived SQLite flags against the runner CLI and exercise the
@@ -64,17 +106,57 @@ Release, other targets, and physical-device behavior remain unqualified.
    fails closed on change; it must not be blindly refreshed.
 3. Build with the pinned toolchain and `--locked`; record linkage and the Selene
    source from the lockfile.
-4. Run the full test suite. Zero executed tests fails. Sum passing test instances
-   over binaries; included-module tests repeat and are not unique scenarios.
+4. Run the full suite with `cargo nextest run --locked --no-tests=fail`.
+   Zero executed tests fails; preserve the runner's exit via `pipefail`.
+   Parse passing instances only from the uncolored nextest `Summary` line;
+   included-module tests repeat across binaries and are not unique scenarios.
+   The [profile](../.config/nextest.toml) retains default CPU parallelism,
+   `retries = 0`, `slow-timeout = "60s"` (warnings only, no termination), and
+   `fail-fast = false` (no new cancellation on first failing test). There is
+   no auto-retry, per-test termination policy, or new clippy/fmt gate.
 5. Print the informational evidence report, rerun `evidence_completeness`, and
    assert `health`/`run` start, stop and refusal markers with observed exits.
 6. Record compiler, host, SQLite version, selection, tested checkout SHA and
    source-tree state. A timeout is never evidence of a successful stop.
 
-Checkout is pinned to an exact v4 action commit. No project-artifact cache is
-restored or saved: hosted product runs are clean-room for project artifacts,
-**not a hermetic tool/OS environment**. The test-log SHA-256 is supplemental,
+Checkout is pinned to the unchanged exact v4 action commit. **Clean-room policy
+amendment:** every run still uses a fresh checkout and current product sources,
+but no longer a clean-room dependency build. `Swatinem/rust-cache@v2` restores
+and saves the following paths (under `CARGO_HOME`, normally `~/.cargo`):
+
+- `registry`: dependency index/cache and crate archives; ordinary unpacked
+  sources are recreated, with retained `-sys` sources for timestamp-sensitive builds.
+- `git`: dependency clone databases and pinned checkouts (an explicit addition
+  beyond registry data; this is not Verdant's source checkout).
+- `target`: dependency build artifacts, fingerprints and build-script output;
+  workspace-crate builds, incremental artifacts and test reports are cleaned
+  before saving. `cache-workspace-crates` and `cache-all-crates` stay false.
+
+`cache-bin: false` excludes Cargo's `bin`, `.crates.toml` and `.crates2.json`
+from restore/save and avoids cleaning/clobbering installed tools and rustup
+shims. No additional cache directories are configured. SQLite archives,
+nextest executables, product sources, stores and test results are not reused
+as evidence. Cache keys include OS/architecture, toolchain, manifests/lockfile
+and Rust build environment; the action disables incremental builds. The cache
+action's path/key log is the record of what a particular run restored. This
+is **not a hermetic tool/OS environment**. The test-log SHA-256 is supplemental,
 not an independently archived log attestation.
+
+PR and push-main triggers and merge-tree deduplication are unchanged: an
+identical-tree merge records the PR-head provenance instead of executing again;
+tree equality alone does not verify the earlier run's conclusion. Other pushes
+retain the selection policy. Workflow/ref concurrency cancels superseded runs;
+cancellation and the existing 20-minute outer job timeout are never passes or
+successful-stop evidence.
+
+**Observed nextest semantics (0.9.143, macOS/arm64/debug):** before editing the
+gate, `cargo nextest run --locked -E 'none()'` returned **4**, with
+`0 tests run: 0 passed, 0 skipped`; explicit `--no-tests=fail` also returned **4**.
+A one-test selection returned **0** with `1 test run: 1 passed, 98 skipped`.
+The gate therefore uses the explicit native empty-run failure plus a positive
+summary-count check, not libtest's nested `test result` lines. The exact empty
+probe can be repeated with `cargo nextest run --locked --no-tests=fail -E 'none()'`;
+its expected nonzero exit is a successful policy probe, not a passing test run.
 
 The delivery anchor is a **green product CI run at the delivered head**, its run
 ID and tested checkout SHA; PR jobs can test a merge checkout. Historical runs
