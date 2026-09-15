@@ -35,6 +35,9 @@ mod accept;
 mod api;
 mod runtime;
 mod observation;
+// M02-PR05 human action preview (synthetic-only templates; no CLI change here).
+#[allow(dead_code)]
+mod action_preview;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
