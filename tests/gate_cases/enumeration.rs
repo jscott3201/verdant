@@ -81,16 +81,17 @@ fn mandatory_skipped_empty_and_blocked_cases_have_reasons_not_silent_passes() {
     }
     let empty_gate = workflow("Test — full run, empty execution fails (product execution)");
     let gate = &empty_gate[empty_gate.find("passed=\"").unwrap()..];
-    for log in ["", "test result: ok. 0 passed; 0 failed; 0 ignored\n"] {
+    for log in ["", "     Summary [   0.010s] 0 tests run: 0 passed, 0 skipped\n",
+        "test result: ok. 99 passed; 0 failed; 0 ignored\n"] {
         std::fs::write(root.0.join("pr01-test.log"), log).unwrap();
         let output = Command::new("bash").args(["-c", gate]).current_dir(&root.0).output().unwrap();
         assert_eq!(output.status.code(), Some(3));
         assert!(String::from_utf8(output.stdout).unwrap().contains("empty tests: 0 tests executed — an empty run does NOT pass."));
     }
-    println!("M01_G_ENUM empty-log,zero-tests=refused exit=3 reason=empty-execution-not-pass");
-    std::fs::write(root.0.join("pr01-test.log"), "test result: ok. 2 passed; 0 failed\ntest result: ok. 3 passed; 0 failed\n").unwrap();
+    println!("M01_G_ENUM empty-log,zero-tests,nested-libtest-only=refused exit=3 reason=empty-execution-not-pass");
+    std::fs::write(root.0.join("pr01-test.log"), "test result: ok. 99 passed; 0 failed\n     Summary [   0.010s] 5 tests run: 5 passed, 0 skipped\n").unwrap();
     let positive = clean(Command::new("bash").args(["-c", gate]).current_dir(&root.0).output().unwrap());
-    assert!(positive.contains("Executed passing tests (summed over suites): 5"));
+    assert!(positive.contains("Executed passing test instances (across binaries): 5"));
     // Fail the external tool-install seam; use CI's implicit bash -e. No build,
     // test, or downstream inventory may be mistaken for completed setup.
     let install = workflow("Install pinned toolchain (setup layer)");
@@ -162,7 +163,7 @@ pub fn no_field_dispatch(root: &Scratch) {
         .env("HOME", &root.0).stdin(Stdio::null()).output().unwrap());
     let expected = format!(concat!(
         "verdant health checked\nversion: 0.1.0\nrustc: rustc 1.97.1 (8bab26f4f 2026-07-14)\n",
-        "target: aarch64-apple-darwin\nprofile: debug\n",
+        "target: {}\nprofile: debug\n",
         "field_capability: absent (no field listener in PR01; native engine deferred to M01-PR05)\n",
         "listener: none (local-only; PR01 binds no socket)\n",
         "stores: not-implemented (durable stores owned by M01-PR03)\n",
@@ -170,7 +171,7 @@ pub fn no_field_dispatch(root: &Scratch) {
         "sqlite_linked: no (system sqlite3 present, not linked in PR01)\n",
         "config: ok ({})\nrole: standalone\ndurable_path: {} (present, directory)\n",
         "secret: env:M01_GATE_SECRET=present ({} chars, value redacted)\n"),
-        config.display(), root.0.display(), SECRET.len());
+        env!("VERDANT_BUILD_TARGET"), config.display(), root.0.display(), SECRET.len());
     assert_eq!(health.as_bytes(), expected.as_bytes());
     let child = Command::new(env!("CARGO_BIN_EXE_verdant"))
         .args(["run", "--config"]).arg(&config).arg("--once")

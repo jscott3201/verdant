@@ -22,7 +22,9 @@ The supported starting point is a source checkout. The binary crate is marked
 `publish = false`; these instructions do not assume an installable registry
 package or a prebuilt release.
 
-Prerequisites for the evidenced **macOS / Apple Silicon / debug** environment:
+CI runs on **Linux x86_64 / debug** (`ubuntu-latest`); **macOS / Apple Silicon /
+debug** remains a local/manual validation lane. A configured lane is not proof:
+use its actual run log, target and tested checkout SHA. Prerequisites:
 
 - Rust **1.97.1**, selected by [rust-toolchain.toml](rust-toolchain.toml). With
   `rustup` installed, use the pinned toolchain rather than changing the pin.
@@ -31,12 +33,17 @@ Prerequisites for the evidenced **macOS / Apple Silicon / debug** environment:
 - **`shasum` 6.0 or newer** on `PATH`, plus `/usr/bin/shasum` for application
   seals. Both the tool and its runtime must be trusted.
 - Git and the native build tools needed by the Rust toolchain.
+- **cargo-nextest 0.9.143** for the primary test path; `cargo test` remains usable.
+  Linux CI provisions the pinned SQLite tools and `/usr/bin/shasum` before other
+  setup; see [tool provisioning](docs/evidence-levels.md#linux-tool-provisioning).
 
 ```sh
 git clone https://github.com/jscott3201/verdant.git
 cd verdant
 cargo build --locked
-cargo test --locked
+cargo install cargo-nextest --locked --version 0.9.143 # if not already installed
+cargo nextest run --locked --no-tests=fail
+cargo test --locked # supported fallback / runner-compatibility sanity check
 ./target/debug/verdant evidence
 ```
 
@@ -115,7 +122,7 @@ services. See [evidence levels](docs/evidence-levels.md) for that distinction.
 | Credentials and authority | Synthetic credentials and actors only; FNV fingerprints are not cryptographic authentication, signatures, or an identity provider. |
 | Meaning and qualification | `mapped`, `imported`, and structurally `valid` do not mean `observed-qualified`. A seal or accepted/active pointer does not grant field authority. |
 | Transports | No BACnet or Modbus traffic, COV subscriptions, discovery, writes, or listener. There is no operational hub, MCP surface, UI, or fault/work service. |
-| Platforms | Evidence is **macOS / arm64 / debug** (`aarch64-apple-darwin`) only. Release builds, other targets, and physical devices are unqualified. |
+| Platforms | Linux-only CI records **x86_64 / debug** evidence at the tested head; **macOS / arm64 / debug** (`aarch64-apple-darwin`) is local/manual validation. Neither lane proves the other; a workflow edit alone proves neither. Release builds, other targets, and physical devices remain unqualified. |
 | Durability | Process-crash/reopen and synthetic capacity tests are **not power-loss or real disk-full proof**. The native alpha store is disposable across dependency-pin changes. |
 | Resource limits | Limits are per handle/shared family, not host-global quotas. Fixture budgets are not measured capacity, performance, or real-time guarantees. |
 | Local trust | Stores require a trusted owner-writable parent, trusted tools, and controlled `HOME`/`.sqliterc`; this is not a hostile-filesystem sandbox. |
@@ -135,6 +142,8 @@ claims within the evidence. Do not use real credentials or facility data in test
 Use the build/test commands above, and rerun the report-completeness check with:
 
 ```sh
+cargo nextest run --locked --no-tests=fail --test role_boundaries -E 'test(=evidence_completeness)' --nocapture
+# Fallback:
 cargo test --locked evidence_completeness -- --nocapture
 ```
 
@@ -144,6 +153,15 @@ files may not grow. The [CI workflow](.github/workflows/pr01.yml) includes full
 tests and explicit start/stop/refusal smoke assertions. Only changes consisting
 entirely of `*.md` skip product execution; license files and SVGs do not qualify.
 A docs-only skip must never be reported as a product-test pass.
+
+The nextest profile uses default CPU parallelism, **zero retries**, and warn-only
+60s slow notices, without cancelling tests on the first failure. CI cancels
+superseded workflow runs on the same ref; cancellation is not a pass. No clippy
+or fmt gate is added. Fresh checkout/product sources remain mandatory, but
+registry/git dependency data and compiled dependencies in `target` are reused
+by `rust-cache` with `cache-bin: false` (no rustup-shim/tool cache). This explicitly
+replaces the former artifact-clean-room policy; see the
+[exact cache scope and evidence policy](docs/evidence-levels.md#ci-evidence-policy).
 
 ### Repository map
 

@@ -138,7 +138,9 @@ impl Inventory {
         assert_eq!(rust, "rustc 1.97.1 (8bab26f4f 2026-07-14)\n");
         assert_eq!(cargo, "cargo 1.97.1 (c980f4866 2026-06-30)\n");
         assert_eq!(env!("VERDANT_RUSTC_VERSION"), rust.trim());
-        assert_eq!(env!("VERDANT_BUILD_TARGET"), "aarch64-apple-darwin");
+        // build.rs exports Cargo's TARGET to both the binary and this test.
+        let target = env!("VERDANT_BUILD_TARGET");
+        assert!(!target.is_empty() && target != "unknown", "build target must be recorded");
         assert!(cfg!(debug_assertions), "M01-G evidence is debug only");
         assert!(include_str!("../../rust-toolchain.toml").contains("channel = \"1.97.1\""));
         assert!(include_str!("../../Cargo.toml").contains("rust-version = \"1.97.1\""));
@@ -170,9 +172,9 @@ impl Inventory {
         let hash_tool = format!("{} -a 256; version={}", seal_hash_exe.display(), seal_shasum.trim());
         let binary_digest = digest(Path::new(env!("CARGO_BIN_EXE_verdant")), &hash_exe);
         let binary = format!("m01-gate-verdant-sha256-{binary_digest}");
-        let host = "m01-gate-macos-arm64-debug".into();
+        let host = format!("m01-gate-{target}-debug");
         let mut text = format!(
-            "head={head}\nbase={BASE}\nsource_state={}rust={rust}cargo={cargo}target=aarch64-apple-darwin\nprofile=debug\nsqlite3={sqlite}shasum={shasum}selene={SELENE}\nmigrations=0001_init,0002_receipts,0003_observations\nprofile_id={PROFILE}\nconverter={CONVERTER}\nbinary_sha256={binary_digest}\n",
+            "head={head}\nbase={BASE}\nsource_state={}rust={rust}cargo={cargo}target={target}\nhost={host}\nprofile=debug\nsqlite3={sqlite}shasum={shasum}selene={SELENE}\nmigrations=0001_init,0002_receipts,0003_observations\nprofile_id={PROFILE}\nconverter={CONVERTER}\nbinary_sha256={binary_digest}\n",
             run("git", &["status", "--porcelain", "--untracked-files=all"]),
         );
         text.push_str(&format!("sqlite3_executable={}\nshasum_executable={}\nseal_hash_tool={hash_tool}\n",
@@ -209,8 +211,9 @@ impl Inventory {
         assert_eq!(&parts[..3], ["verdant-seal-v1", "valid-structural-not-qualified", "scope-a"]);
         assert_eq!(&parts[4..7], ["1", PROFILE, CONVERTER]);
         let runtime = fields(&parts[7]);
+        assert_eq!(self.host, format!("m01-gate-{}-debug", env!("VERDANT_BUILD_TARGET")));
         assert_eq!(runtime, [self.binary.as_str(), self.host.as_str(), "0.1.0",
-            "rustc 1.97.1 (8bab26f4f 2026-07-14)", "aarch64-apple-darwin", SELENE]);
+            "rustc 1.97.1 (8bab26f4f 2026-07-14)", env!("VERDANT_BUILD_TARGET"), SELENE]);
         assert_eq!(parts[8], crate::support::AUTHOR);
         assert_eq!(parts[9], self.hash_tool);
         assert_eq!(commit.manifest.row_count(), 2); // stage -> actor-joined finding

@@ -36,13 +36,19 @@ tutorial bloat.
 
 ```sh
 cargo build --locked
-cargo test --locked
-./target/debug/verdant evidence   # informational report; execution owned by cargo test + CI
+cargo nextest run --locked --no-tests=fail   # primary runner, cargo-nextest 0.9.143
+cargo test --locked                        # supported local fallback/sanity path
+./target/debug/verdant evidence   # informational report; not test execution
 ```
 
-- CI lives at `.github/workflows/pr01.yml`: selection policy, build, full
-  test run (empty execution fails), evidence report, and smoke
+- CI lives at `.github/workflows/pr01.yml`: Linux-only (`ubuntu-latest`),
+  selection policy, build, full nextest run (empty execution fails), evidence report, and smoke
   start/stop/refusal assertions. Read it before changing checks.
+- Install nextest locally if absent with `cargo install cargo-nextest --locked
+  --version 0.9.143`; CI uses `taiki-e/install-action` with the same version.
+  `.config/nextest.toml` keeps default CPU parallelism, zero retries, 60s slow
+  warnings without termination, and no first-failure cancellation. No new
+  clippy/fmt gates. macOS/arm64/debug validation remains local/manual only.
 - Full product validation also re-runs the evidence-completeness test and the
   `health` / `run` smoke markers; see the workflow for the exact steps.
 - SQLite CLI flags are extracted from the reviewed storage argument surface
@@ -50,10 +56,19 @@ cargo test --locked
   surface fails closed: review extraction/callers before updating its digest;
   never blindly refresh it. Preserve the 3.50.x compatibility boundary
   (`src/storage/sqlite/connection.rs:21–30`, `execution.rs:322–332`).
-- CI records `otool -L` (no SQLite dynamic linkage) and the Selene source from
-  `Cargo.lock`; the former alone is not a static-link audit. Checkout is pinned
-  to PR19's observed v4 SHA. There is no cache restore/save: every hosted product
-  run is clean-room for project artifacts, not a hermetic runner/tool image.
+- CI provisions `libdigest-sha-perl` via apt for `/usr/bin/shasum`, and SQLite
+  3.53.4 from the pinned sqlite.org Linux x64 tools archive, verifying its
+  published SHA3-256 before extraction. URL/hash and measured versions are in
+  the workflow pins inventory; stock Ubuntu SQLite is below the 3.50.0 floor.
+- CI records Linux `ldd` (no SQLite dynamic linkage) and the Selene source from
+  `Cargo.lock`; macOS `otool -L` is local-only. Neither is a static-link audit.
+  Checkout stays pinned to PR19's observed v4 SHA. Fresh checkout/product sources
+  are always used, but dependency artifacts are no longer clean-room:
+  `Swatinem/rust-cache@v2` restores Cargo registry data, git dependency clones/
+  checkouts, and `target` dependency builds. `cache-bin: false` excludes installed
+  tools/rustup shims; workspace builds and incremental artifacts are not cached.
+  Exact cache paths/exclusions are in `docs/evidence-levels.md`; the runner/tool
+  image is not hermetic and cached artifacts never replace executing tests.
 
 ## Conventions
 
@@ -104,9 +119,11 @@ report it as a finding instead.
 
 - Docs-only changes (only `*.md`, per the CI selection policy) skip product
   execution and must NOT claim product tests ran.
-- Product changes require `cargo build --locked`, the full `cargo test
-  --locked` run (empty execution fails), the `evidence` report, and the smoke
+- Product changes require `cargo build --locked`, the full `cargo nextest run
+  --locked --no-tests=fail` run, the `evidence` report, and the smoke
   assertions — and must report the exact pins, target, and profile tested.
+  `cargo test --locked` remains a local fallback/sanity check, not evidence of a
+  nextest run. This binary-only crate has no separate library doctest target.
 - `.yml` is not docs-only. Preserve selection, empty-fails, evidence,
   completeness, smoke and pins when changing CI. Sum passing test instances
   over binaries; do not call repeated included-module tests unique scenarios.
@@ -120,7 +137,10 @@ report it as a finding instead.
 - The CI test-log SHA-256 is supplemental, not independent archival proof.
   Anchor delivery to green product CI at the delivered head, run ID and tested
   checkout SHA; a prior run or report alone does not validate later edits.
-- Current evidence is macOS/arm64/debug only. Process-crash and synthetic
+- Linux CI proves only the target/profile/tree in its green product run; moving
+  the workflow to Ubuntu is not itself Linux execution evidence. Historical
+  macOS CI and manual macOS/arm64/debug runs do not validate Linux, or vice versa.
+  There is no release-tier qualification. Process-crash and synthetic
   space-budget tests are not power-loss/disk-full qualification; handle-family
   limits are not host-global quotas. Native-row fixtures are contract-only,
   not application row persistence. See [README limits](README.md#explicit-limits)

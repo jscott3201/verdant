@@ -47,7 +47,14 @@ impl Target {
         if !matches!(unit, 1..=247 | 255) {
             return Err(Error::InvalidUnit);
         }
-        if address.ip() != Ipv4Addr::LOCALHOST || !(49152..=65535).contains(&address.port()) {
+        // test_peer::Pair::at proves ephemeral allocation by binding :0 (reconnect
+        // reuses that peer). A number alone cannot prove it: OS ranges are tunable.
+        // Match the capture audit: unprivileged, excluding Modbus, BACnet and the
+        // refused 8080 listener fixture; never admit a facility address.
+        if address.ip() != Ipv4Addr::LOCALHOST
+            || address.port() < 1024
+            || [502, 802, 8080, 47808].contains(&address.port())
+        {
             return Err(Error::DeniedDestination);
         }
         Ok(Self { address, unit })

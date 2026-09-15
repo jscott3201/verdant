@@ -4,7 +4,7 @@
 # - Setup failure  = toolchain install / checkout fails (its own step).
 # - Docs-only      = only *.md changed under the selection policy: product
 #                    steps are SKIPPED explicitly and must not claim tests ran.
-# - Empty tests    = cargo test executes zero tests: hard FAIL (green badge
+# - Empty tests    = nextest executes zero tests: hard FAIL (green badge
 #                    alone is not evidence).
 # - Product        = build + full test run + evidence report + smoke run.
 # - Already-validated = push of a merge whose tree equals its second parent's
@@ -21,8 +21,10 @@
 #
 # Least privilege: contents:read. Checkout is pinned to the exact v4 commit
 # observed in successful PR19 run 34714433781 (not a moving tag).
-# No cache restore/save exists: each hosted product run builds/tests in a fresh
-# checkout, clean-room with respect to project artifacts (not a hermetic OS).
+# Fresh checkout/product sources always; dependency artifacts are NOT clean-room:
+# rust-cache restores Cargo registry + git dependencies + target dependency builds.
+# No workspace-crate, incremental, cargo-bin, tool archive or test-result cache.
+# See docs/evidence-levels.md for exact paths; this is not a hermetic OS/tool image.
 # The test-log digest is supplemental; green product CI plus its tested checkout
 # SHA is the anchor, not a self-referential report hash. An identical-tree merge
 # reuses the green PR-head run for that tree, not the record-only merge run.
@@ -37,14 +39,46 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pr01-checks:
-    # macos-14 is arm64 (Apple Silicon), matching the D02 macOS/arm64 family.
-    # The exact runner is recorded in the pins step; only the tested target
-    # is claimed, all others remain untested.
-    runs-on: macos-14
+    # Linux-only CI; macOS/arm64/debug validation is local/manual, not this lane.
+    # Only a green product run at its recorded target/checkout is Linux evidence.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # SQLite 3.53.4, Linux x86_64; upstream SHA3SUM (SHA3-256) published at
+      # https://sqlite.org/download.html for sqlite-tools-linux-x64-3530400.zip.
+      # Freeze URL + published checksum, not the moving download page at run time.
+      SQLITE_VERSION: '3.53.4'
+      SQLITE_URL: https://sqlite.org/2026/sqlite-tools-linux-x64-3530400.zip
+      SQLITE_SHA3: 6eeb57e8f2aef7687f9f016a980992cf2799c8c07a87c5e21495530f91915047
     steps:
+      - name: Provision host tools first (setup layer)
+        id: tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y libdigest-sha-perl
+          test -x /usr/bin/shasum
+          /usr/bin/shasum --version
+          # Stock Ubuntu SQLite 3.45 is below the unchanged 3.50.0 test floor.
+          test "$(uname -m)" = x86_64
+          tools="$RUNNER_TEMP/verdant-sqlite-tools"
+          mkdir -p "$tools"
+          curl --fail --show-error --location --proto '=https' --tlsv1.2 "$SQLITE_URL" -o "$tools/sqlite-tools.zip"
+          actual="$(openssl dgst -sha3-256 "$tools/sqlite-tools.zip" | awk '{print $NF}')"
+          test "$actual" = "$SQLITE_SHA3"
+          echo "sqlite_sha3=$actual" >> "$GITHUB_OUTPUT"
+          unzip -q "$tools/sqlite-tools.zip" sqlite3 -d "$tools"
+          chmod +x "$tools/sqlite3"
+          echo "$tools" >> "$GITHUB_PATH"
+          "$tools/sqlite3" --version
+          test "$("$tools/sqlite3" --version | cut -d ' ' -f 1)" = "$SQLITE_VERSION"
+
       - name: Checkout (setup layer)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 as observed in PR19
         with:
@@ -52,7 +86,7 @@ jobs:
 
       - name: Install pinned toolchain (setup layer)
         run: |
-          set -u
+          set -euo pipefail
           rustup toolchain install 1.97.1 --profile minimal
           rustup override set 1.97.1
           rustc -V
@@ -101,6 +135,23 @@ jobs:
             echo "selection=product" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Restore dependency cache (product setup)
+        if: steps.classify.outputs.selection == 'product'
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Never restore/clean cargo bin: that can clobber rustup shims.
+          cache-bin: false
+          cache-workspace-crates: false
+          cache-all-crates: false
+
+      - name: Install pinned nextest (product setup)
+        if: steps.classify.outputs.selection == 'product'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+          checksum: true
+          fallback: none
+
       - name: SQLite CLI flag compatibility (product execution)
         if: steps.classify.outputs.selection == 'product'
         run: |
@@ -113,7 +164,7 @@ jobs:
           # calls are harmlessly included; dedicated *_tests.rs are not product.
           surface="$(git grep -hE 'Command::|\.args?\(|run_script(_stdin)?\(|"-{1,2}[[:alnum:]][[:alnum:]-]*"' -- src/storage ':(exclude)src/storage/sqlite/*_tests.rs')"
           digest="$(printf '%s\n' "$surface" | shasum -a 256 | awk '{print $1}')"
-          if [ "$digest" != 377203c4df62680336b5b0aa426bcc97d9854ebce820d51940d44a357e1e9968 ]; then
+          if [ "$digest" != 323987ed6b6897dd6a17d14dfa7e5587ad941177d7ef635bde8fd3f3e2c80c6a ]; then
             printf '%s\n' "$surface"
             echo '::error::SQLite argument surface changed; review flag extraction before execution.'
             exit 1
@@ -157,8 +208,13 @@ jobs:
         if: steps.classify.outputs.selection == 'product'
         run: |
           set -euo pipefail
-          linkage="$(otool -L ./target/debug/verdant)"
+          # ldd includes transitive dynamic dependencies; otool -L is macOS-local only.
+          linkage="$(ldd ./target/debug/verdant)"
           printf '%s\n' "$linkage"
+          if printf '%s\n' "$linkage" | grep -q 'not found'; then
+            echo '::error::unresolved dynamic library; linkage evidence incomplete'
+            exit 1
+          fi
           if printf '%s\n' "$linkage" | grep -iq sqlite; then
             echo '::error::unexpected SQLite dynamic linkage'
             exit 1
@@ -170,10 +226,13 @@ jobs:
       - name: Test — full run, empty execution fails (product execution)
         if: steps.classify.outputs.selection == 'product'
         run: |
-          set -u -o pipefail
-          cargo test --locked 2>&1 | tee pr01-test.log
-          passed="$(grep -oE '[0-9]+ passed' pr01-test.log | awk '{s+=$1} END {print s+0}')"
-          echo "Executed passing tests (summed over suites): $passed"
+          set -euo pipefail
+          # 0.9.143 empirically: -E 'none()' => exit 4, '0 tests run: 0 passed'.
+          # --no-tests=fail makes that policy explicit; pipefail retains runner errors.
+          cargo nextest run --locked --no-tests=fail --color never 2>&1 | tee pr01-test.log
+          # Only nextest's summary, not nested libtest output or failure diagnostics.
+          passed="$(grep -E '^[[:space:]]*Summary ' pr01-test.log | grep -oE '[0-9]+ passed' | awk '{s+=$1} END {print s+0}')"
+          echo "Executed passing test instances (across binaries): $passed"
           if [ "$passed" -le 0 ]; then
             echo "::error::empty tests: 0 tests executed — an empty run does NOT pass."
             exit 3
@@ -187,7 +246,7 @@ jobs:
           set -u
           cargo run --locked -- evidence
           echo "--- explicit evidence-completeness re-run (manifest visible) ---"
-          cargo test --locked evidence_completeness -- --nocapture
+          cargo nextest run --locked --no-tests=fail --test role_boundaries -E 'test(=evidence_completeness)' --nocapture
 
       - name: Smoke — start/stop + refusals with explicit codes (product execution)
         if: steps.classify.outputs.selection == 'product'
@@ -217,15 +276,26 @@ jobs:
           echo "--- compiler/toolchain ---"
           rustc -V || true
           cargo -V || true
+          rustc -vV || true
+          cargo nextest --version || true
           echo "--- host ---"
           uname -a || true
-          sw_vers || true
-          sysctl -n machdep.cpu.brand_string || true
-          sysctl -n hw.ncpu || true
-          sysctl -n hw.memsize || true
+          cat /etc/os-release || true
+          lscpu || true
+          free -h || true
           df -h . || true
-          echo "--- sqlite (system CLI; linkage checked separately on product runs) ---"
+          echo "--- sqlite-tools pin (CLI subprocess; linkage checked separately) ---"
+          echo "version=$SQLITE_VERSION URL=$SQLITE_URL"
+          echo "published-SHA3-256=$SQLITE_SHA3 (https://sqlite.org/download.html)"
+          echo "verified-archive-SHA3-256=${{ steps.tools.outputs.sqlite_sha3 }}"
+          command -v sqlite3 || true
           sqlite3 --version || true
+          echo "--- shasum (apt libdigest-sha-perl; floor 6.0, version measured) ---"
+          dpkg-query -W libdigest-sha-perl || true
+          /usr/bin/shasum --version || true
+          /usr/bin/shasum -a 256 "$(command -v sqlite3)" /usr/bin/shasum || true
+          echo "--- cache policy ---"
+          echo 'Fresh product checkout; Cargo registry/git + target dependency cache only; cache-bin=false.'
           echo "--- selection ---"
           echo "selection=${{ steps.classify.outputs.selection }}"
           echo "--- tested source/tree (CI manifest; distinct from any later report commit) ---"

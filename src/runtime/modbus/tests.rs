@@ -3,6 +3,22 @@
 use super::*;
 
 #[test]
+fn modbus_loopback_port_admission_is_platform_independent() {
+    // Socket-free regression: accept unprivileged non-service ports below the
+    // former macOS-only range, without binding any fixed port on this host.
+    for port in [1024, 32768, 49151, 49152, u16::MAX] {
+        let address = (std::net::Ipv4Addr::LOCALHOST, port).into();
+        assert_eq!(Target::loopback(address, 255).unwrap().address(), address);
+    }
+    for port in [0, 502, 802, 1023, 8080, 47808] {
+        assert!(matches!(
+            Target::loopback((std::net::Ipv4Addr::LOCALHOST, port).into(), 255),
+            Err(Error::DeniedDestination)
+        ), "port {port}");
+    }
+}
+
+#[test]
 fn modbus_admission_denies_every_service_except_four_reads() {
     for fc in 0..=255 {
         assert_eq!(Function::parse(fc).is_ok(), matches!(fc, 1..=4));

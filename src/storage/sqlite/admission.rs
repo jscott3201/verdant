@@ -68,9 +68,12 @@ fn parent_path(path: &Path) -> Result<PathBuf, StorageError> {
     if path.is_dir() {
         return Err(StorageError::UnwritablePath { path: path.display().to_string(), reason: "database path is a directory".into() });
     }
+    // Refuse before even the owner probe, version probe or reference CLI runs.
+    super::connection::refuse_leaf_symlink(path)?;
     #[cfg(unix)] {
         use std::os::unix::fs::MetadataExt as _;
         let meta = fs::metadata(parent).map_err(|e| io_error(path, e))?;
+        #[cfg(test)] super::faults::record_spawn_attempt();
         let uid = Command::new("id").arg("-u").output().map_err(|e| io_error(path, e))?;
         let uid = String::from_utf8_lossy(&uid.stdout).trim().parse::<u32>()
             .map_err(|_| failure("cannot establish process owner"))?;
@@ -345,23 +348,33 @@ mod tests {
     #[test]
     fn io_path_leaf_symlinks_still_refuse_without_touching_targets() {
         let scratch = Scratch::new();
+        let initial_spawns = super::super::faults::spawn_attempts();
         drop(scratch.open().expect("target"));
+        assert!(super::super::faults::spawn_attempts() > initial_spawns, "spawn observer must see valid opens");
         let target = scratch.0.join("real/store.db");
         let before = fs::read(&target).expect("target bytes");
         for name in ["store.db", "absent.db"] {
             let leaf = scratch.0.join("public/leaf.db");
             symlink(scratch.0.join("real").join(name), &leaf).expect("leaf alias");
             let entries = scratch.entries();
+            let spawns = super::super::faults::spawn_attempts();
             let error = open(&leaf, ConnectionSettings::local_wal_full(), StoreBounds::tiny()).unwrap_err();
             assert_eq!(error.code(), "sqlite-failure");
-            // Exercise -nofollow itself too, not just the initial metadata check.
-            let error = Connection::open(&leaf, Operation::standalone(&ConnectionSettings::local_wal_full(), &StoreBounds::tiny()).expect("budget")).expect("spawn").exchange("SELECT 1;").unwrap_err();
+            assert_eq!(super::super::faults::spawn_attempts(), spawns, "admission must refuse before any child");
             let detail = error.to_string();
             assert!(detail.contains(leaf.to_str().expect("public path")), "{detail}");
             assert!(!detail.contains(scratch.0.join("real/leaf.db").to_str().expect("OS path")), "{detail}");
-            let output = run_script_stdin(&leaf, &[], "SELECT 1;").expect("stdin driver exit");
-            assert!(!output.status.success(), "stdin driver must refuse the leaf alias");
-            let detail = String::from_utf8_lossy(&output.stderr);
+            // Lower-level callers must also refuse before spawn, not at exchange.
+            let error = Connection::open(&leaf, Operation::standalone(&ConnectionSettings::local_wal_full(), &StoreBounds::tiny()).expect("budget")).err().expect("leaf refusal before connection");
+            assert_eq!(error.code(), "sqlite-failure");
+            assert_eq!(super::super::faults::spawn_attempts(), spawns, "connection must refuse before spawn");
+            let detail = error.to_string();
+            assert!(detail.contains(leaf.to_str().expect("public path")), "{detail}");
+            assert!(!detail.contains(scratch.0.join("real/leaf.db").to_str().expect("OS path")), "{detail}");
+            let error = run_script_stdin(&leaf, &[], "SELECT 1;").unwrap_err();
+            assert_eq!(error.code(), "sqlite-failure");
+            assert_eq!(super::super::faults::spawn_attempts(), spawns, "stdin driver must refuse before spawn");
+            let detail = error.to_string();
             assert!(detail.contains(leaf.to_str().expect("public path")), "{detail}");
             assert!(!detail.contains(scratch.0.join("real/leaf.db").to_str().expect("OS path")), "{detail}");
             assert_eq!(fs::read(&target).expect("unchanged target"), before);
