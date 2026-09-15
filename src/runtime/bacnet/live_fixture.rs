@@ -4,7 +4,7 @@
 use super::{
     client::ReadPort,
     fake::Delivery,
-    test_loopback::{Packet, PORT_RELEASE_GUARD},
+    test_loopback::{assert_fixture_port, Packet, PORT_RELEASE_GUARD},
     *,
 };
 use bacnet_transport::port::{ReceivedNpdu, TransportPort};
@@ -215,7 +215,7 @@ impl Harness {
         assert_ne!(client, peer);
         for endpoint in [client, peer] {
             assert_eq!(endpoint.ip(), Ipv4Addr::LOCALHOST);
-            assert!((49152..=65535).contains(&endpoint.port()), "named macOS ephemeral port");
+            assert_fixture_port(endpoint.port());
         }
         for p in &packets {
             assert!((p.from == f.0.client && p.to == f.0.peer) || (p.from == f.0.peer && p.to == f.0.client));

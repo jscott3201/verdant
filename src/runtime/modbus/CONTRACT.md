@@ -16,10 +16,14 @@ These are source evidence, not a protocol-conformance certification.
 
 ## Admission and meaning
 
-- Only `127.0.0.1`, ports 49152–65535, unit 255 (direct TCP) or 1–247
+- Only `127.0.0.1`, ports ≥1024 excluding 502/802/8080/47808, unit 255 (direct TCP) or 1–247
   (addressed loopback fixture) can be admitted. Unit 0 is refused before a
   public client call. There is no DNS, routed destination, broadcast, generic
   request, unrestricted client accessor, write or listener API in the wrapper.
+  Ephemeral allocation is established by `test_peer::Pair::at` binding the peer
+  to `127.0.0.1:0` (reconnect reuses that peer) and `TcpTransport::connect` leaving
+  the client port to the OS, not by the numeric admission/audit guard. OS port
+  ranges, including Linux's sysctl-tunable range, are not baked into this boundary.
 - The private runtime admission method verifies current accepted/active sensing
   binding identity before yielding one immutable map. Ordinary CLI dispatch
   remains unchanged and never starts this client. This is synthetic preparation,
@@ -108,8 +112,9 @@ not syscall or IP packet counts. Responses deliberately split across header/PDU.
 | reconnect-before / reconnect-after-same-peer | same named peer, fresh source, sticky lost interval |
 | coverage-loss-PR03B | actual timeout composed with unchanged bounded custody/replay |
 
-All captured traffic is directed between the named loopback endpoints; 502/802
-are forbidden. These are **instrumented fixture-boundary captures, not host-wide
+All captured traffic is directed between the named loopback endpoints; privileged
+ports and 502/802/8080/47808 are forbidden (Modbus, the refused listener fixture,
+and BACnet). These are **instrumented fixture-boundary captures, not host-wide
 pcap or evidence about uninstrumented/off-interface traffic**. Malformed-PDU
 cases retain well-framed MBAP envelopes; hostile/truncated MBAP byte streams are
 not newly qualified here. No facility values, PLC, physical link, broadcast,
