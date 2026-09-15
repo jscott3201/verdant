@@ -142,6 +142,7 @@ impl Process {
 
     pub(super) fn spawn(mut command: Command, path: &Path, operation: Arc<Operation>) -> Result<Self, StorageError> {
         operation.remaining()?;
+        #[cfg(test)] super::faults::record_spawn_attempt();
         let child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
             .map_err(|e| if e.kind() == io::ErrorKind::NotFound { StorageError::MissingSqlite { detail: e.to_string() } }
                 else { admission::io_error(path, e) })?;

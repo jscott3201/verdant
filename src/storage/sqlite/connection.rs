@@ -4,11 +4,26 @@
 use super::*;
 use super::execution::{Operation, Process};
 
+pub(super) fn refuse_leaf_symlink(path: &Path) -> Result<(), StorageError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_symlink() => Err(failure(&format!("database leaf must not be a symlink: {}", path.display()))),
+        Ok(_) => Ok(()),
+        // Fresh creation and the stdin driver permit a missing leaf. Held
+        // connections still require existence in Connection::open below.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(super::admission::io_error(path, error)),
+    }
+}
+
 pub(super) fn canonical_parent_path(path: &Path) -> Result<PathBuf, StorageError> {
     // Resolve only the parent (macOS /var is an alias), never the leaf.
     let parent = path.parent().ok_or_else(|| failure("database parent missing"))?;
     let leaf = path.file_name().ok_or_else(|| failure("database filename missing"))?;
-    Ok(parent.canonicalize().map_err(|e| super::admission::io_error(path, e))?.join(leaf))
+    let io_path = parent.canonicalize().map_err(|e| super::admission::io_error(path, e))?.join(leaf);
+    // Both CLI entry points pass here before spawning. CLI refusal alone can
+    // arrive after WAL side effects; keep diagnostics on the caller's path.
+    refuse_leaf_symlink(path)?;
+    Ok(io_path)
 }
 
 pub(super) struct Connection {
@@ -21,7 +36,7 @@ impl Connection {
     pub(super) fn open(path: &Path, operation: Arc<Operation>) -> Result<Self, StorageError> {
         operation.remaining()?;
         let io_path = canonical_parent_path(path)?;
-        // R03 policy frozen: Rust checks existence; -nofollow guards the leaf.
+        // Rust refuses symlinked leaves before spawn; -nofollow is defense in depth.
         // No -ifexists/-noinit in 3.50.x; controlled HOME is a prerequisite.
         std::fs::symlink_metadata(path).map_err(|e| super::admission::io_error(path, e))?;
         let mut command = Command::new("sqlite3");

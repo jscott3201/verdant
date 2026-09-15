@@ -164,7 +164,7 @@ jobs:
           # calls are harmlessly included; dedicated *_tests.rs are not product.
           surface="$(git grep -hE 'Command::|\.args?\(|run_script(_stdin)?\(|"-{1,2}[[:alnum:]][[:alnum:]-]*"' -- src/storage ':(exclude)src/storage/sqlite/*_tests.rs')"
           digest="$(printf '%s\n' "$surface" | shasum -a 256 | awk '{print $1}')"
-          if [ "$digest" != 377203c4df62680336b5b0aa426bcc97d9854ebce820d51940d44a357e1e9968 ]; then
+          if [ "$digest" != 323987ed6b6897dd6a17d14dfa7e5587ad941177d7ef635bde8fd3f3e2c80c6a ]; then
             printf '%s\n' "$surface"
             echo '::error::SQLite argument surface changed; review flag extraction before execution.'
             exit 1
