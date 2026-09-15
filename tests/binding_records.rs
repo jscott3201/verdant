@@ -397,7 +397,7 @@ fn migration_0002_0003_coexist_with_generation_1_consumers() {
         migrations.push(entry.file_name().to_string_lossy().into_owned());
     }
     migrations.sort();
-    assert_eq!(migrations, vec!["0001_init.sql", "0002_receipts.sql", "0003_observations.sql"]);
+    assert_eq!(migrations, vec!["0001_init.sql", "0002_receipts.sql", "0003_observations.sql", "0004_action_journal.sql"]);
     assert_eq!(storage::SCHEMA_GENERATION, 1);
     assert_eq!(binding::registry::BINDING_SCHEMA_GENERATION, 1);
     // Binding rows coexist with access rows in the same outbox.

@@ -38,6 +38,9 @@ mod observation;
 // M02-PR05 human action preview (synthetic-only templates; no CLI change here).
 #[allow(dead_code)]
 mod action_preview;
+// M02-PR06 durable admission and per-target state (inert sink; no CLI change here).
+#[allow(dead_code)]
+mod action_journal;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
