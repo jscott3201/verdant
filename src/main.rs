@@ -50,6 +50,9 @@ mod action_expiry;
 // M02-PR11 uncertain effects and restart recovery (harness-only; no CLI change here).
 #[allow(dead_code)]
 mod action_recovery;
+// M02-PR09 publication, replacement and exclusion (harness-only; no CLI change here).
+#[allow(dead_code)]
+mod action_publication;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
