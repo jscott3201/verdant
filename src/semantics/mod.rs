@@ -26,3 +26,4 @@ pub mod parse;
 pub mod matrix;
 pub mod ledger;
 pub mod recipe;
+pub mod materialize;
