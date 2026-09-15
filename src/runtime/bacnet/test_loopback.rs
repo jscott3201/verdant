@@ -26,6 +26,28 @@ const QUEUE: usize = 64;
 // concurrent fixture may legitimately acquire a just-released ephemeral port
 // before its previous owner verifies release. Test isolation, not admission.
 pub(crate) static PORT_RELEASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// Ephemeral allocation is proven by the :0 UDP binds in live_fixture::Harness::new
+// and the :0 TCP listener bind in modbus::test_peer::Pair::at (reconnect reuses it).
+// That TCP fixture's TcpTransport::connect also leaves the client port to the OS.
+// This audit excludes privileged/service ports, not OS ranges: Linux's range is
+// sysctl-tunable. 502/802 are Modbus, 47808 BACnet, 8080 the refused listener fixture.
+pub(super) fn assert_fixture_port(port: u16) {
+    assert!(port >= 1024, "unprivileged fixture port: {port}");
+    assert!(![502, 802, 8080, 47808].contains(&port), "service port forbidden: {port}");
+}
+
+#[test]
+fn fixture_port_audit_is_platform_independent() {
+    // Numeric audit only: no fixed-port binds or claims of live Linux execution.
+    for port in [1024, 32768, 49151, 49152, u16::MAX] {
+        assert_fixture_port(port);
+    }
+    for port in [0, 502, 802, 1023, 8080, 47808] {
+        assert!(std::panic::catch_unwind(|| assert_fixture_port(port)).is_err(), "port {port}");
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub sent: bool,
@@ -92,9 +114,8 @@ impl PacketLog {
         assert!(!packets.is_empty());
         for p in &packets {
             assert!((p.from == client && p.to == peer) || (p.from == peer && p.to == client));
-            assert!((49152..=65535).contains(&p.from.port()));
-            assert!((49152..=65535).contains(&p.to.port()));
-            assert!(![502, 802].contains(&p.from.port()) && ![502, 802].contains(&p.to.port()));
+            assert_fixture_port(p.from.port());
+            assert_fixture_port(p.to.port());
         }
         for (from, to) in [(client, peer), (peer, client)] {
             let stream = |sent| packets.iter().filter(|p| p.sent == sent && p.from == from && p.to == to)
