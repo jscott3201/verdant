@@ -246,7 +246,12 @@ fn r04_timeout_before_commit_is_noncommit_with_preserved_bytes() {
 fn r04_timeout_after_commit_is_unknown_then_same_identity_reconciles() {
     let scratch = Scratch::new();
     let mut store = scratch.open();
-    tune(&mut store).settings.operation_timeout_ms = 150;
+    // M01 busy-retry precedent: allow loaded-runner scheduling margin so
+    // pre-commit spawn/CLI startup/INSERT complete before the deadline.
+    // This is ~33x the former 150ms budget; AFTER_COMMIT's unbounded COMPUTE
+    // still hangs past it, preserving Unknown-after-commit ordering and the
+    // strict counts/reconciliation assertions.
+    tune(&mut store).settings.operation_timeout_ms = 5000;
     let request = pending(&store);
     AFTER_COMMIT.with(|flag| flag.set(true));
     let outcome = store.submit(&request);
