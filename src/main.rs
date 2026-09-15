@@ -41,6 +41,9 @@ mod action_preview;
 // M02-PR06 durable admission and per-target state (inert sink; no CLI change here).
 #[allow(dead_code)]
 mod action_journal;
+// M02-PR07 controlled dispatch and observed outcomes (harness-only; no CLI change here).
+#[allow(dead_code)]
+mod action_dispatch;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
