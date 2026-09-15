@@ -121,6 +121,29 @@ pub struct BindingContext {
     property: Property,
 }
 impl BindingContext {
+    /// Test-only join for PR36 loopback read envelopes; confers no field authority.
+    /// Retains every synthetic selection check and adds a loopback/property guard.
+    /// Neither a peer response nor this context establishes observed qualification.
+    #[cfg(test)]
+    pub(crate) fn loopback(
+        config: &EffectiveConfig,
+        raw: &RawEnvelope,
+        property: Property,
+    ) -> Result<Self> {
+        let RawOutcome::Bacnet(batch) = &raw.outcome else {
+            return Err(Error::Invalid("not a loopback property read"));
+        };
+        let [a, b, c, d, hi, lo] = *batch.target.mac();
+        if [a, b, c, d] != [127, 0, 0, 1]
+            || u16::from_be_bytes([hi, lo]) == 0
+            || raw.receipt_origin != ReceiptOrigin::BacnetClientReturn
+            || batch.properties.iter().filter(|p| p.property == property).count() != 1
+        {
+            return Err(Error::Invalid("loopback read context"));
+        }
+        Self::synthetic(config, raw, property)
+    }
+
     pub fn synthetic(config: &EffectiveConfig, raw: &RawEnvelope, property: Property) -> Result<Self> {
         let entry = config
             .entries()
