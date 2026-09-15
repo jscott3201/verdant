@@ -44,6 +44,9 @@ mod action_journal;
 // M02-PR07 controlled dispatch and observed outcomes (harness-only; no CLI change here).
 #[allow(dead_code)]
 mod action_dispatch;
+// M02-PR08 normal expiry and exact release (harness-only policy; no CLI change here).
+#[allow(dead_code)]
+mod action_expiry;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
