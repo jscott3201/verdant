@@ -23,17 +23,31 @@ pub enum ProtocolResult {
 }
 
 /// Slot readback: priority-array slot 8 value with its own receipt times.
-/// Never labeled an atomic controller snapshot. `source_time` stays `None`.
+/// Never labeled an atomic controller snapshot. `source_time` stays `None`
+/// (never fabricated sensor time). `receipt_*` are response-correlated
+/// (captured AFTER the read response arrives), not request-start; slot and PV
+/// are independent (separate reads, separate times), never an atomic snapshot.
+/// A delayed read proves `receipt_monotonic >= request_start`; tests assert it.
+/// Per-readback validity is preserved: one known/other-invalid stays an
+/// `Outcome` with one valid readback, never collapsed to generic `Invalid`.
+/// Client stop/join evidence (harness `starts/stops/eofs`) stays separate
+/// from cancellation ack or equipment release (see harness provenance).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotReadback {
     value: Vec<u8>,
     receipt_wall: SystemTime,
     receipt_monotonic: Instant,
+    valid: bool,
 }
 
 impl SlotReadback {
     pub fn new(value: Vec<u8>, receipt_wall: SystemTime, receipt_monotonic: Instant) -> Self {
-        Self { value, receipt_wall, receipt_monotonic }
+        Self { value, receipt_wall, receipt_monotonic, valid: true }
+    }
+    /// Invalid readback: value is empty, `valid` is false; the other
+    /// readback's known value is still preserved in the same `Outcome`.
+    pub fn invalid(receipt_wall: SystemTime, receipt_monotonic: Instant) -> Self {
+        Self { value: Vec::new(), receipt_wall, receipt_monotonic, valid: false }
     }
     pub fn value(&self) -> &[u8] {
         &self.value
@@ -43,6 +57,11 @@ impl SlotReadback {
     }
     pub fn receipt_monotonic(&self) -> Instant {
         self.receipt_monotonic
+    }
+    /// Per-readback validity: `true` for a decoded response, `false` for a
+    /// transport/invalid reply preserved alongside the other known readback.
+    pub fn is_valid(&self) -> bool {
+        self.valid
     }
     pub fn source_time(&self) -> Option<SystemTime> {
         None
@@ -53,17 +72,24 @@ impl SlotReadback {
 }
 
 /// PV readback: effective `presentValue` with its own receipt times, separate
-/// from the slot readback. Never atomic, never qualified.
+/// from the slot readback. Never atomic, never qualified. Same
+/// response-correlated, independent, non-fabricated semantics as slot; see
+/// above. Validity preserved per-readback; stop/join stays separate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PvReadback {
     value: Vec<u8>,
     receipt_wall: SystemTime,
     receipt_monotonic: Instant,
+    valid: bool,
 }
 
 impl PvReadback {
     pub fn new(value: Vec<u8>, receipt_wall: SystemTime, receipt_monotonic: Instant) -> Self {
-        Self { value, receipt_wall, receipt_monotonic }
+        Self { value, receipt_wall, receipt_monotonic, valid: true }
+    }
+    /// Invalid readback preserved alongside the known other readback.
+    pub fn invalid(receipt_wall: SystemTime, receipt_monotonic: Instant) -> Self {
+        Self { value: Vec::new(), receipt_wall, receipt_monotonic, valid: false }
     }
     pub fn value(&self) -> &[u8] {
         &self.value
@@ -73,6 +99,10 @@ impl PvReadback {
     }
     pub fn receipt_monotonic(&self) -> Instant {
         self.receipt_monotonic
+    }
+    /// Per-readback validity (see slot).
+    pub fn is_valid(&self) -> bool {
+        self.valid
     }
     pub fn source_time(&self) -> Option<SystemTime> {
         None

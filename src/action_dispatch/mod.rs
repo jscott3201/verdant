@@ -52,6 +52,8 @@
 
 #[cfg(test)]
 pub(crate) mod harness;
+#[cfg(test)]
+pub(crate) mod harness_provenance;
 pub mod outcome;
 #[allow(unused_imports)]
 pub use outcome::*;
@@ -98,6 +100,7 @@ pub enum DispatchError {
     Ceiling { have: u8, required: u8 },
     ScopeDenied { expected: String, presented: String },
     StaleGeneration { expected: u32, current: u32 },
+    StalePayload { detail: String },
     RevisionMismatch { detail: String },
     Deadline,
     Cancelled,
@@ -112,6 +115,7 @@ impl DispatchError {
             Self::Ceiling { .. } => "ceiling-exceeded",
             Self::ScopeDenied { .. } => "dispatch-scope-denied",
             Self::StaleGeneration { .. } => "dispatch-stale-generation",
+            Self::StalePayload { .. } => "dispatch-stale-payload",
             Self::RevisionMismatch { .. } => "dispatch-revision-mismatch",
             Self::Deadline => "dispatch-deadline",
             Self::Cancelled => "dispatch-cancelled",
@@ -137,6 +141,7 @@ impl std::fmt::Display for DispatchError {
                 f,
                 "dispatch stale generation: expected {expected}, current is {current}"
             ),
+            Self::StalePayload { detail } => write!(f, "dispatch stale payload (0004 rounded, lossless required): {detail}"),
             Self::RevisionMismatch { detail } => write!(f, "dispatch revision mismatch: {detail}"),
             Self::Deadline => write!(f, "dispatch deadline elapsed before handoff completion"),
             Self::Cancelled => write!(f, "dispatch cancelled before handoff completion"),
@@ -445,12 +450,22 @@ fn check_binding_status(status: &BindingStatus) -> Result<()> {
 
 /// Verify content before the handoff: actor/ceiling/policy/binding/value.
 /// No SQL guard, no building-wide lock, no network yet.
+/// Lossless Slice-A: presentation `{:.4}` equality is necessary but not
+/// sufficient; exact `wire_bits`, explicit kind and release target must also
+/// match. Legacy 0004 rows (no identity) refuse as stale-payload here while
+/// staying readable via journal reconcile (no backfill).
 pub(crate) fn verify_content(
     admitted: &Admitted,
     preview: &Preview,
     current: &Current,
     route: &FrozenRoute,
 ) -> Result<()> {
+    // Compatibility: 0004 rounded payloads refuse for new handoffs.
+    if admitted.is_legacy() {
+        return Err(DispatchError::StalePayload {
+            detail: "0004 rounded payload lacks lossless wire_bits/kind/target; re-admit with 0005 identity".to_string(),
+        });
+    }
     check_ceiling(current.ceiling(), current.role())?;
     check_ceiling(admitted.ceiling(), current.role())?;
     if current.actor() != admitted.actor() {
@@ -492,13 +507,47 @@ pub(crate) fn verify_content(
     if admitted.payload() != preview.canonical_bytes() {
         return Err(DispatchError::Invalid("admitted payload differs from preview"));
     }
+    // Lossless identity: distinct binary32 sharing `{:.4}` text MUST NOT match.
+    if admitted.wire_bits() != Some(preview.encoded().wire_bits()) {
+        return Err(DispatchError::Invalid("wire identity mismatch: distinct binary32 sharing rounded text"));
+    }
+    if admitted.action_kind().map(|k| k.as_str()) != Some(preview.action_kind()) {
+        return Err(DispatchError::Invalid("action kind mismatch: SET cannot authorize release and vice versa"));
+    }
+    if admitted.release_admitted() != Some(preview.release_admitted()) {
+        return Err(DispatchError::Invalid("release admission mismatch: swapped preview"));
+    }
+    if admitted.release_target().map(|t| t.as_str()) != Some(preview.release_target().as_str()) {
+        return Err(DispatchError::Invalid("release target changed since admission"));
+    }
     if admitted.deadline_secs() != DEADLINE_SECS {
         return Err(DispatchError::Invalid("deadline 5s"));
     }
     Ok(())
 }
 
+/// Identical retry predicate: same presentation plus exact bits/kind/target.
+/// Identical retries are authorized outcome inspection (read-only readbacks,
+/// no new WriteProperty), not a new physical attempt. Swapped kind/target or
+/// distinct bits with equal text are NOT identical and refuse upstream.
+pub fn is_identical_retry(admitted: &Admitted, preview: &Preview) -> bool {
+    if admitted.is_legacy() {
+        return false;
+    }
+    admitted.payload() == preview.canonical_bytes()
+        && admitted.wire_bits() == Some(preview.encoded().wire_bits())
+        && admitted.action_kind().map(|k| k.as_str()) == Some(preview.action_kind())
+        && admitted.release_admitted() == Some(preview.release_admitted())
+        && admitted.release_target().map(|t| t.as_str()) == Some(preview.release_target().as_str())
+}
+
 pub(crate) fn verify_generation(admitted: &Admitted, current: &Current) -> Result<()> {
+    // Pre/post generation (traced, not ±1): `expected` is the pre-admission
+    // token observed before the CAS; `target = expected + 1` is the
+    // post-admission value stored in `action_targets`. Handoff requires
+    // `Current == expected` (no intervening admission), not `target`.
+    // Replacement/release tracing lives with activation; do not adjust by ±1
+    // without that trace.
     if current.current_generation != admitted.expected_generation() {
         return Err(DispatchError::StaleGeneration {
             expected: admitted.expected_generation(),
@@ -519,6 +568,9 @@ pub(crate) fn verify_generation(admitted: &Admitted, current: &Current) -> Resul
 /// generation/value/deadline at the local handoff boundary, then encode ONLY
 /// AV2/PV85/P8 Real(`f32`). The final no-I/O gate (`cancel.check`) runs after
 /// encoding so refused work consumes no script and no capture.
+/// SET-only: a release admission (kind `release`) refuses here; use
+/// `prepare_release` with the identical release preview instead (swapped-kind
+/// barrier, not a preview-only decision).
 pub fn prepare_setpoint(
     admitted: &Admitted,
     preview: &Preview,
@@ -530,8 +582,20 @@ pub fn prepare_setpoint(
     check_frozen_preview(preview)?;
     verify_content(admitted, preview, current, route)?;
     verify_generation(admitted, current)?;
+    if admitted.action_kind().map(|k| k.as_str()) != Some("set") {
+        return Err(DispatchError::Invalid("SET admission required: release admission cannot authorize SET via swapped preview"));
+    }
+    if preview.action_kind() != "set" {
+        return Err(DispatchError::Invalid("SET preview required: release preview cannot authorize SET"));
+    }
     cancel.check(deadline)?;
     let encoded = preview.encoded();
+    // Wire coherence: preview bits must equal admitted bits (distinct binary32
+    // sharing `{:.4}` text already refused in `verify_content`; re-assert the
+    // exact bits carried on the wire).
+    if admitted.wire_bits() != Some(encoded.wire_bits()) {
+        return Err(DispatchError::Invalid("wire bits differ from admitted identity"));
+    }
     let value = real_value_bytes(encoded.wire_bits());
     let write = FrozenWrite {
         object_type: FROZEN_OBJECT_TYPE,
@@ -549,6 +613,10 @@ pub fn prepare_setpoint(
 /// Prepare a frozen release (NULL relinquish at P8). Encoded NULL only for an
 /// explicitly admitted release; otherwise `NullNotAdmitted`. NULL, Real zero,
 /// and enumerated inactive remain distinct by construction.
+/// Swapped-kind barrier lives in `verify_content` (SET vs release kinds must
+/// match); non-admitted NULL (SET kind via release path) stays
+/// `NullNotAdmitted` via `null_wire`, preserving existing refusal. Release
+/// target change refuses in `verify_content` (no retargeting).
 pub fn prepare_release(
     admitted: &Admitted,
     preview: &Preview,

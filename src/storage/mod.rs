@@ -153,6 +153,21 @@ pub const MIGRATION_0004: MigrationRecord = MigrationRecord {
     rollback_boundary: "no downgrade or rewrite; unknown schema/ledger refused without repair",
 };
 
+pub const MIGRATION_0005_SQL: &str = include_str!("../../migrations/sqlite/0005_action_identity.sql");
+pub const MIGRATION_0005: MigrationRecord = MigrationRecord {
+    backend: "sqlite",
+    owner: "M02-SliceA",
+    id: "0005_action_identity",
+    predecessors: &["0004_action_journal"],
+    fresh_install: "0001 plus 0002 plus 0003 plus 0004 plus 0005 in one private transaction before publication (writer-gated; fresh open stays at 0003 until writer ensure)",
+    supported_upgrade: "validated 0004 to 0005; 0001/0002/0003 first apply through 0004; no content backfill, legacy NULLs refuse as stale-payload",
+    queued_msg_compat: "outbox and other owners' receipts unchanged; four nullable identity columns plus one index",
+    lock_space: "BEGIN IMMEDIATE; WAL/FULL; extra identity storage; no automatic pruning",
+    interruption: "atomic migration rollback; admitted rows retain UNKNOWN until reconciliation",
+    read_write_policy: "user_version stays 1; exact ledger revision 3, 4 or 5 and application/store identity",
+    rollback_boundary: "no downgrade or rewrite; unknown schema/ledger refused without repair",
+};
+
 /// Per-connection durability settings. Recorded on every connection and
 /// re-read in-band; never inferred from another connection.
 #[derive(Debug, Clone, PartialEq, Eq)]

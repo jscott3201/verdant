@@ -25,20 +25,21 @@
 //! verdant-preview-v1, no backfill, no rewrite helpers, no aliases.
 
 use crate::accept::AcceptedRevision;
-use crate::access::{RoleKind, REQUIRED_PUBLISH_CEILING};
-use crate::action_preview::{
-    Preview, DEADLINE_SECS, DURATION_SECS, PREVIEW_FORMAT, RATE_MAX_PER_HOUR,
-};
+use crate::access::RoleKind;
+use crate::action_preview::Preview;
 use crate::binding;
 use crate::domain::ids::{BindingRevision, InstalledId, OperationId};
 use crate::domain::scope::TrustedScope;
-use crate::runtime::bacnet::APDU_RETRIES;
 use crate::storage::sqlite::{MutationOutcome, PreparedMutation, SqliteStore};
 use crate::storage::{
     ConnectionSettings, Handoff, HandoffReceiver, HandoffSender, StorageError, StoreBounds,
     MIGRATION_0004_SQL,
 };
 use std::path::Path;
+
+pub mod identity;
+pub use identity::{ActionKind, Identity};
+use self::identity::{check_actor, check_ceiling, check_preview, map_submit_error};
 
 /// Journal wire format tag (inert sink; no wire emission in this slice).
 pub const JOURNAL_FORMAT: &str = "verdant-action-journal-v1";
@@ -54,6 +55,7 @@ pub enum WriterError {
     ScopeDenied { expected: String, presented: String },
     Conflict { detail: String },
     StaleGeneration { expected: u32, current: u32 },
+    StalePayload { detail: String },
     NotFound { operation: String },
     Unknown { operation: OperationId, detail: String },
     Storage(StorageError),
@@ -67,6 +69,7 @@ impl WriterError {
             Self::ScopeDenied { .. } => "admission-scope-denied",
             Self::Conflict { .. } => "admission-conflict",
             Self::StaleGeneration { .. } => "admission-stale-generation",
+            Self::StalePayload { .. } => "admission-stale-payload",
             Self::NotFound { .. } => "admission-not-found",
             Self::Unknown { .. } => "admission-unknown",
             Self::Storage(inner) => inner.code(),
@@ -91,6 +94,7 @@ impl std::fmt::Display for WriterError {
                 f,
                 "admission stale generation: expected {expected}, current is {current}"
             ),
+            Self::StalePayload { detail } => write!(f, "admission stale payload (0004 rounded, lossless required): {detail}"),
             Self::NotFound { operation } => {
                 write!(f, "admission not found for '{operation}' in this scope")
             }
@@ -117,6 +121,10 @@ impl From<StorageError> for WriterError {
 pub type Result<T> = std::result::Result<T, WriterError>;
 
 /// Durable admitted intent: the journal row plus reconciliation flag.
+/// Slice-A lossless identity: exact `wire_bits`, explicit `set`/`release`
+/// kind, release admission plus authorized target. Legacy 0004 rows carry
+/// `None` and refuse for new handoffs as stale-payload (readable via
+/// reconcile, no backfill).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admitted {
     row_id: i64,
@@ -133,6 +141,10 @@ pub struct Admitted {
     actor: String,
     attempt: OperationId,
     reconciled: bool,
+    wire_bits: Option<u32>,
+    action_kind: Option<ActionKind>,
+    release_admitted: Option<bool>,
+    release_target: Option<InstalledId>,
 }
 
 impl Admitted {
@@ -149,19 +161,26 @@ impl Admitted {
     pub fn ceiling(&self) -> u8 { self.ceiling }
     pub fn actor(&self) -> &str { &self.actor }
     pub fn attempt(&self) -> &OperationId { &self.attempt }
-    pub fn reconciled(&self) -> bool { self.reconciled
+    pub fn reconciled(&self) -> bool { self.reconciled }
+    pub fn wire_bits(&self) -> Option<u32> { self.wire_bits }
+    pub fn action_kind(&self) -> Option<ActionKind> { self.action_kind }
+    pub fn release_admitted(&self) -> Option<bool> { self.release_admitted }
+    pub fn release_target(&self) -> Option<&InstalledId> { self.release_target.as_ref() }
+    /// Legacy 0004 rounded payload (no lossless identity): readable but stale.
+    pub fn is_legacy(&self) -> bool { self.wire_bits.is_none() || self.action_kind.is_none() }
+    /// Lossless identity string for identical-retry comparison (None if legacy).
+    pub fn identity_string(&self) -> Option<String> {
+        let kind = self.action_kind?;
+        Some(format!("bits{:08X}|kind:{}|rel:{}:{}|{}", self.wire_bits?, kind.as_str(), u8::from(self.release_admitted?), self.release_target.as_ref()?.as_str(), self.payload))
     }
-    pub fn journal_format(&self) -> &'static str {
-        JOURNAL_FORMAT
-    }
+    pub fn journal_format(&self) -> &'static str { JOURNAL_FORMAT }
     /// Inert sink: admitted intent never dispatches to wire here.
-    pub fn is_dispatch(&self) -> bool {
-        false
-    }
+    pub fn is_dispatch(&self) -> bool { false }
 }
 
 /// Prepared admission: validated intent plus a retained storage ticket.
 /// Submit reconciles or commits; cancel drops without a row or handoff.
+/// Carries lossless identity for post-commit conflict comparison.
 #[derive(Debug)]
 pub struct PendingAdmission {
     operation: OperationId,
@@ -172,6 +191,7 @@ pub struct PendingAdmission {
     expected_generation: u32,
     target_generation: u32,
     payload: String,
+    identity: Identity,
     deadline_secs: u64,
     ceiling: u8,
     actor: String,
@@ -179,15 +199,10 @@ pub struct PendingAdmission {
 }
 
 impl PendingAdmission {
-    pub fn operation(&self) -> &OperationId {
-        &self.operation
-    }
-    pub fn scope(&self) -> &TrustedScope {
-        &self.scope
-    }
-    pub fn expected_generation(&self) -> u32 {
-        self.expected_generation
-    }
+    pub fn operation(&self) -> &OperationId { &self.operation }
+    pub fn scope(&self) -> &TrustedScope { &self.scope }
+    pub fn expected_generation(&self) -> u32 { self.expected_generation }
+    pub fn identity(&self) -> &Identity { &self.identity }
 }
 
 /// Receivers for the two independent bounded queues.
@@ -213,6 +228,7 @@ impl Journal {
     ) -> Result<(Self, JournalReceivers)> {
         let (store, _) = SqliteStore::open(db_path, settings, bounds.clone())?;
         ensure_0004(&store)?;
+        crate::action_journal::identity::ensure_0005(&store)?;
         let (essential_tx, essential) = Handoff::new(bounds.max_tasks).split();
         let (history_tx, history) = Handoff::new(HISTORY_CAPACITY).split();
         Ok((
@@ -278,38 +294,15 @@ impl Journal {
                 detail: format!("payload is {} bytes", payload.len()),
             });
         }
-        let body = admission_body(
-            &operation,
-            &scope,
-            preview.target().equipment(),
-            preview.target().binding_revision(),
-            preview.target().accepted_revision(),
-            expected_generation,
-            target_generation,
-            &payload,
-            preview.timing().deadline_secs(),
-            ceiling,
-            &actor,
-            &operation,
+        let identity = Identity::from_preview(preview);
+        let body = crate::action_journal::identity::admission_body_v2(
+            &operation, &scope, preview.target().equipment(), preview.target().binding_revision(), preview.target().accepted_revision(), expected_generation, target_generation, &payload, preview.timing().deadline_secs(), ceiling, &actor, &operation, &identity,
         );
         let ticket = self
             .store
             .prepare_guarded_batch("1", &body, payload.len())?
             .with_operation(operation.clone());
-        Ok(PendingAdmission {
-            operation,
-            scope,
-            equipment: preview.target().equipment().clone(),
-            binding_revision: preview.target().binding_revision(),
-            accepted_revision: preview.target().accepted_revision(),
-            expected_generation,
-            target_generation,
-            payload,
-            deadline_secs: preview.timing().deadline_secs(),
-            ceiling,
-            actor,
-            ticket,
-        })
+        Ok(PendingAdmission { operation, scope, equipment: preview.target().equipment().clone(), binding_revision: preview.target().binding_revision(), accepted_revision: preview.target().accepted_revision(), expected_generation, target_generation, payload, identity, deadline_secs: preview.timing().deadline_secs(), ceiling, actor, ticket })
     }
 
     /// Commit or reconcile one prepared admission, then announce to the
@@ -325,11 +318,7 @@ impl Journal {
             MutationOutcome::Committed { .. } => {
                 let mut found = self.read_row(&pending.operation, &pending.scope)?;
                 found.reconciled = false;
-                if found.payload != pending.payload {
-                    return Err(WriterError::Conflict {
-                        detail: "operation identity reused with different payload".to_string(),
-                    });
-                }
+                Self::require_identical(pending, &found)?;
                 found
             }
             MutationOutcome::NotCommitted { error: StorageError::SqliteFailure { detail }, .. }
@@ -402,11 +391,7 @@ impl Journal {
         match self.store.reconcile(&pending.ticket) {
             MutationOutcome::Committed { .. } => {
                 let mut found = self.read_row(&pending.operation, &pending.scope)?;
-                if found.payload != pending.payload {
-                    return Err(WriterError::Conflict {
-                        detail: "operation identity reused with different payload".to_string(),
-                    });
-                }
+                Self::require_identical(pending, &found)?;
                 found.reconciled = true;
                 Ok(Some(found))
             }
@@ -424,18 +409,56 @@ impl Journal {
         scope: &TrustedScope,
     ) -> Result<Admitted> {
         let script = format!(
-            "SELECT operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state FROM action_journal WHERE operation={} AND scope={};",
+            "SELECT operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state, wire_bits, action_kind, release_admitted, release_target FROM action_journal WHERE operation={} AND scope={};",
             binding::sql_quote(operation.as_str()),
             binding::sql_quote(scope.as_str()),
         );
-        let rows = self.store.exec_script(&script)?;
+        // 0004 stores lack the identity columns: fall back to the 13-column
+        // shape so legacy rows stay readable (they refuse later as stale).
+        let rows = match self.store.exec_script(&script) {
+            Ok(rows) => rows,
+            Err(StorageError::SqliteFailure { detail }) if detail.contains("no such column") => {
+                let legacy = format!(
+                    "SELECT operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state FROM action_journal WHERE operation={} AND scope={};",
+                    binding::sql_quote(operation.as_str()),
+                    binding::sql_quote(scope.as_str()),
+                );
+                self.store.exec_script(&legacy).map_err(WriterError::from)?
+            }
+            Err(other) => return Err(WriterError::from(other)),
+        };
         let row = rows.into_iter().next().ok_or_else(|| WriterError::NotFound {
             operation: operation.as_str().to_string(),
         })?;
-        if row.len() != 13 {
+        if row.len() != 13 && row.len() != 17 {
             return Err(WriterError::Invalid("journal row shape"));
         }
         decode_row(row, scope)
+    }
+
+    /// Lossless identical-retry comparison: payload text plus exact wire_bits,
+    /// kind, release admission and target. Distinct binary32 values sharing
+    /// `{:.4}` text MUST NOT reconcile; swapped kind/target refuses as
+    /// conflict (SET cannot authorize release and vice versa). Identical
+    /// retries are authorized outcome inspection, not a new physical attempt
+    /// (dispatch inspection path, Slice B durable custody deferred).
+    fn require_identical(pending: &PendingAdmission, found: &Admitted) -> Result<()> {
+        if found.payload != pending.payload {
+            return Err(WriterError::Conflict { detail: "operation identity reused with different payload".to_string() });
+        }
+        // Legacy stored rows have no identity: any new admission with the same
+        // operation but lossless identity conflicts (rounded text is not proof).
+        let Some(found_bits) = found.wire_bits else {
+            return Err(WriterError::Conflict { detail: "operation identity reused: legacy rounded payload vs lossless identity".to_string() });
+        };
+        if found_bits != pending.identity.wire_bits
+            || found.action_kind != Some(pending.identity.kind)
+            || found.release_admitted != Some(pending.identity.release_admitted)
+            || found.release_target.as_ref() != Some(&pending.identity.release_target)
+        {
+            return Err(WriterError::Conflict { detail: "operation identity reused with different lossless identity (bits/kind/target)".to_string() });
+        }
+        Ok(())
     }
 
     fn current_generation(
@@ -457,108 +480,14 @@ impl Journal {
     }
 }
 
-fn check_ceiling(ceiling: u8, role: RoleKind) -> Result<()> {
-    match role {
-        RoleKind::Publisher => {
-            if ceiling < REQUIRED_PUBLISH_CEILING {
-                return Err(WriterError::Ceiling {
-                    have: ceiling,
-                    required: REQUIRED_PUBLISH_CEILING,
-                });
-            }
-            Ok(())
-        }
-        RoleKind::Reviewer => Err(WriterError::Ceiling {
-            have: ceiling,
-            required: REQUIRED_PUBLISH_CEILING,
-        }),
-    }
-}
-
-fn check_actor(raw: &str) -> Result<String> {
-    if raw.is_empty() {
-        return Err(WriterError::Invalid("empty actor"));
-    }
-    if raw.len() > 128 {
-        return Err(WriterError::Invalid("actor too long"));
-    }
-    let ok = raw
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'));
-    if !ok {
-        return Err(WriterError::Invalid("actor characters"));
-    }
-    if raw.contains('\x1f') || raw.contains('\n') || raw.contains('\r') {
-        return Err(WriterError::Invalid("actor framing"));
-    }
-    if raw == "VERDANT_BEGIN" || raw == "VERDANT_DATA" || raw == "VERDANT_END" {
-        return Err(WriterError::Invalid("actor sentinel"));
-    }
-    Ok(raw.to_string())
-}
-
-fn check_preview(preview: &Preview) -> Result<()> {
-    if preview.format() != PREVIEW_FORMAT {
-        return Err(WriterError::Invalid("preview format"));
-    }
-    if preview.is_reservation() || preview.is_dispatch() || preview.is_qualified() {
-        return Err(WriterError::Invalid("preview is information only"));
-    }
-    if preview.timing().apdu_retries() != APDU_RETRIES {
-        return Err(WriterError::Invalid("apdu_retries frozen"));
-    }
-    if preview.timing().duration_secs() != DURATION_SECS {
-        return Err(WriterError::Invalid("duration 15min"));
-    }
-    if preview.timing().deadline_secs() != DEADLINE_SECS {
-        return Err(WriterError::Invalid("deadline 5s"));
-    }
-    if preview.timing().rate_per_hour() != RATE_MAX_PER_HOUR {
-        return Err(WriterError::Invalid("rate bound"));
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn admission_body(
-    operation: &OperationId,
-    scope: &TrustedScope,
-    equipment: &InstalledId,
-    binding_revision: BindingRevision,
-    accepted_revision: AcceptedRevision,
-    expected_generation: u32,
-    target_generation: u32,
-    payload: &str,
-    deadline_secs: u64,
-    ceiling: u8,
-    actor: &str,
-    attempt: &OperationId,
-) -> String {
-    let scope_q = binding::sql_quote(scope.as_str());
-    let equip_q = binding::sql_quote(equipment.as_str());
-    let op_q = binding::sql_quote(operation.as_str());
-    let payload_q = binding::sql_quote(payload);
-    let actor_q = binding::sql_quote(actor);
-    let attempt_q = binding::sql_quote(attempt.as_str());
-    let binding_rev = binding_revision.as_u32();
-    let accepted_rev = accepted_revision.get();
-    let expected = expected_generation;
-    let target = target_generation;
-    let deadline = deadline_secs;
-    let mut body = String::new();
-    body.push_str(&format!(
-        "CREATE TEMP TABLE admission_generation(ok INTEGER NOT NULL CONSTRAINT admission_generation CHECK(ok=1)); INSERT INTO admission_generation VALUES(CASE WHEN ((SELECT COALESCE((SELECT current_generation FROM action_targets WHERE scope={scope_q} AND equipment={equip_q}), 0)) = {expected}) THEN 1 ELSE 0 END);"
-    ));
-    body.push_str(&format!(
-        "INSERT INTO action_journal(operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state, created) VALUES ({op_q}, {scope_q}, {equip_q}, {binding_rev}, {accepted_rev}, {expected}, {target}, {payload_q}, {deadline}, {ceiling}, {actor_q}, {attempt_q}, 'admitted', CAST(strftime('%s','now') AS INTEGER));"
-    ));
-    body.push_str(&format!(
-        "INSERT INTO action_targets(scope, equipment, current_generation) VALUES ({scope_q}, {equip_q}, {target}) ON CONFLICT(scope, equipment) DO UPDATE SET current_generation=excluded.current_generation;"
-    ));
-    body
-}
-
 fn decode_row(mut row: Vec<String>, scope: &TrustedScope) -> Result<Admitted> {
+    // 0004 legacy rows: 13 columns (no identity). 0005 rows: 17 columns with
+    // lossless identity (NULL on legacy upgrades stays legacy). Both remain
+    // readable; legacy refuses for new handoffs as stale-payload downstream.
+    let is_legacy_shape = row.len() == 13;
+    if row.len() != 13 && row.len() != 17 {
+        return Err(WriterError::Invalid("journal row shape"));
+    }
     let take = |row: &mut Vec<String>| {
         if row.is_empty() {
             Err(WriterError::Invalid("journal row shape"))
@@ -579,7 +508,7 @@ fn decode_row(mut row: Vec<String>, scope: &TrustedScope) -> Result<Admitted> {
         InstalledId::parse(&take(&mut row)?).map_err(|_| WriterError::Invalid("journal equipment"))?;
     let binding_revision = take(&mut row)?
         .parse::<u32>()
-        .map(|v| BindingRevision::new(v))
+        .map(BindingRevision::new)
         .map_err(|_| WriterError::Invalid("journal binding revision"))?;
     let accepted_revision = AcceptedRevision::new(
         take(&mut row)?
@@ -603,7 +532,7 @@ fn decode_row(mut row: Vec<String>, scope: &TrustedScope) -> Result<Admitted> {
     let deadline_secs = take(&mut row)?
         .parse::<u64>()
         .map_err(|_| WriterError::Invalid("journal deadline"))?;
-    if deadline_secs != DEADLINE_SECS {
+    if deadline_secs != crate::action_preview::DEADLINE_SECS {
         return Err(WriterError::Invalid("deadline 5s"));
     }
     let ceiling = take(&mut row)?
@@ -616,42 +545,39 @@ fn decode_row(mut row: Vec<String>, scope: &TrustedScope) -> Result<Admitted> {
     if take(&mut row)? != "admitted" {
         return Err(WriterError::Invalid("journal state"));
     }
-    Ok(Admitted {
-        row_id: 0,
-        operation,
-        scope: scope.clone(),
-        equipment,
-        binding_revision,
-        accepted_revision,
-        expected_generation,
-        target_generation,
-        payload,
-        deadline_secs,
-        ceiling,
-        actor,
-        attempt,
-        reconciled: false,
-    })
-}
-
-fn map_submit_error(error: StorageError) -> WriterError {
-    match error {
-        StorageError::SqliteFailure { ref detail }
-            if detail.contains("UNIQUE constraint failed: action_journal.operation") =>
-        {
-            WriterError::Conflict {
-                detail: "journal operation already recorded with this store".to_string(),
-            }
-        }
-        StorageError::Conflict { detail } => WriterError::Conflict { detail },
-        other => WriterError::Storage(other),
+    if is_legacy_shape {
+        return Ok(Admitted { row_id: 0, operation, scope: scope.clone(), equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, reconciled: false, wire_bits: None, action_kind: None, release_admitted: None, release_target: None });
     }
+    let wire_bits = match crate::action_journal::identity::parse_nullable(&take(&mut row)?) {
+        None => None,
+        Some(raw) => Some(raw.parse::<u32>().map_err(|_| WriterError::Invalid("journal wire_bits"))?),
+    };
+    let action_kind = match crate::action_journal::identity::parse_nullable(&take(&mut row)?) {
+        None => None,
+        Some(raw) => Some(ActionKind::parse(&raw).ok_or(WriterError::Invalid("journal action kind"))?),
+    };
+    let release_admitted = match crate::action_journal::identity::parse_nullable(&take(&mut row)?) {
+        None => None,
+        Some(raw) => Some(match raw.as_str() { "0" => false, "1" => true, _ => return Err(WriterError::Invalid("journal release admission")) }),
+    };
+    let release_target = match crate::action_journal::identity::parse_nullable(&take(&mut row)?) {
+        None => None,
+        Some(raw) => Some(InstalledId::parse(&raw).map_err(|_| WriterError::Invalid("journal release target"))?),
+    };
+    // Partial identity (some NULL, some set) is corrupt, not legacy: refuse.
+    let legacy = wire_bits.is_none() || action_kind.is_none() || release_admitted.is_none() || release_target.is_none();
+    let complete = wire_bits.is_some() && action_kind.is_some() && release_admitted.is_some() && release_target.is_some();
+    if !legacy && !complete {
+        return Err(WriterError::Invalid("journal identity partial"));
+    }
+    Ok(Admitted { row_id: 0, operation, scope: scope.clone(), equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, reconciled: false, wire_bits, action_kind, release_admitted, release_target })
 }
 
 fn ensure_0004(store: &SqliteStore) -> Result<()> {
     let rows = store.exec_script("SELECT generation FROM schema_migrations ORDER BY generation;")?;
     let generations: Vec<String> = rows.into_iter().filter_map(|r| r.into_iter().next()).collect();
-    if generations == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string()] {
+    if generations == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string()]
+        || generations == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()] {
         return Ok(());
     }
     if generations != vec!["1".to_string(), "2".to_string(), "3".to_string()] {

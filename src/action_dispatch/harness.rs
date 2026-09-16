@@ -14,6 +14,7 @@ use super::{
     ProtocolResult, PvReadback, SlotReadback, FROZEN_INSTANCE, FROZEN_PRIORITY, FROZEN_PROPERTY,
     FROZEN_SLOT_PROPERTY,
 };
+use super::harness_provenance::{emission_established, is_timeout_abort, receipt_now, wire_kind};
 use crate::action_journal::Admitted;
 use crate::action_preview::Preview;
 use bacnet_client::client::{BACnetClient, ClientConfig};
@@ -32,7 +33,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, sync::{mpsc, oneshot}, task::JoinHandle};
 const CAPTURE_ENTRIES: usize = 128;
@@ -484,30 +485,6 @@ impl TransportPort for Port {
     }
 }
 
-fn wire_kind(error: &WireError) -> ProtocolResult {
-    match error {
-        WireError::Protocol { class, code } => ProtocolResult::RemoteError { class: *class, code: *code },
-        WireError::Reject { reason } => ProtocolResult::Reject(*reason),
-        WireError::Abort { reason } => ProtocolResult::Abort(*reason),
-        WireError::Timeout(_) => ProtocolResult::Timeout,
-        WireError::Transport(_) => ProtocolResult::TransportFailure,
-        WireError::Encoding(_)
-        | WireError::Decoding { .. }
-        | WireError::Segmentation(_)
-        | WireError::BufferTooShort { .. }
-        | WireError::InvalidTag(_)
-        | WireError::OutOfRange(_)
-        | WireError::RoutedPathTooLong { .. }
-        | WireError::RoutedPathCapacityExceeded { .. } => ProtocolResult::InvalidReply,
-    }
-}
-fn is_timeout_abort(error: &WireError) -> bool {
-    match error {
-        WireError::Abort { reason } => *reason == 10,
-        WireError::Timeout(_) => true,
-        _ => false,
-    }
-}
 async fn confirmed_write(fixture: &Fixture, write: &FrozenWrite, cancel: &DispatchCancel, deadline: Instant, route: &FrozenRoute) -> std::result::Result<(), WireError> {
     let port = fixture.port(route, cancel.clone(), deadline).map_err(|_| WireError::Encoding("frozen route".into()))?;
     let mut client = BACnetClient::start(
@@ -573,17 +550,6 @@ async fn confirmed_read(fixture: &Fixture, property_raw: u32, array: Option<u32>
         Err(e) => Err(e),
     }
 }
-fn map_read_error(error: WireError, admitted: &Admitted) -> DispatchError {
-    if is_timeout_abort(&error) {
-        DispatchError::Unknown {
-            operation: admitted.operation().as_str().to_string(),
-            attempt: admitted.attempt().as_str().to_string(),
-            detail: "uncertain-not-resend: readback lost; reconcile, do not resend".to_string(),
-        }
-    } else {
-        DispatchError::Invalid("readback invalid reply")
-    }
-}
 /// Execute one frozen setpoint dispatch with handoff rechecks and no SQL guard.
 pub(crate) async fn execute_setpoint(
     admitted: &Admitted,
@@ -615,36 +581,46 @@ pub(crate) async fn execute_setpoint(
     }
     match result {
         Ok(()) => {
-            recheck_after_handoff(admitted, current, cancel, deadline)?;
-            let slot_wall = SystemTime::now();
-            let slot_mono = Instant::now();
-            let slot_bytes = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await.map_err(|e| map_read_error(e, admitted))?;
-            let pv_wall = SystemTime::now();
-            let pv_mono = Instant::now();
-            let pv_bytes = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await.map_err(|e| map_read_error(e, admitted))?;
-            recheck_after_handoff(admitted, current, cancel, deadline)?;
+            // Post-ack MUST NOT discard Outcome on later cancel/deadline.
+            // Receipts are response-correlated (AFTER each read), independent.
+            let _post_ack = recheck_after_handoff(admitted, current, cancel, deadline);
+            let slot_res = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await;
+            let (slot_wall, slot_mono) = receipt_now();
+            let pv_res = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await;
+            let (pv_wall, pv_mono) = receipt_now();
+            let _post_read = recheck_after_handoff(admitted, current, cancel, deadline);
+            let slot = match slot_res { Ok(b) => SlotReadback::new(b, slot_wall, slot_mono), Err(_) => SlotReadback::invalid(slot_wall, slot_mono) };
+            let pv = match pv_res { Ok(b) => PvReadback::new(b, pv_wall, pv_mono), Err(_) => PvReadback::invalid(pv_wall, pv_mono) };
             let audit = Audit::new(fixture.sent_count());
             assert_eq!(audit.effective_retries(), 0);
             assert_eq!(audit.apdu_retries(), 0);
-            Ok(Outcome::new(admitted, ProtocolResult::Confirmed, SlotReadback::new(slot_bytes, slot_wall, slot_mono), PvReadback::new(pv_bytes, pv_wall, pv_mono), Feedback::unavailable(), audit))
+            Ok(Outcome::new(admitted, ProtocolResult::Confirmed, slot, pv, Feedback::unavailable(), audit))
         }
         Err(e) if is_timeout_abort(&e) => Err(DispatchError::Unknown {
             operation: admitted.operation().as_str().to_string(),
             attempt: admitted.attempt().as_str().to_string(),
             detail: "uncertain-not-resend: response lost after handoff; reconcile, do not resend".to_string(),
         }),
-        Err(e) if matches!(e, WireError::Encoding(_)) && cancel.check(deadline).is_err() => Err(cancel.check(deadline).unwrap_err()),
+        Err(e) if matches!(e, WireError::Encoding(_)) && cancel.check(deadline).is_err() => {
+            // Encoding+cancel: known not-attempted ONLY when non-emission
+            // established (zero capture); otherwise possibly-emitted Unknown.
+            if emission_established(fixture.sent_count()) {
+                Err(DispatchError::Unknown { operation: admitted.operation().as_str().to_string(), attempt: admitted.attempt().as_str().to_string(), detail: "uncertain-not-resend: cancel raced send; reconcile, do not resend".to_string() })
+            } else {
+                Err(cancel.check(deadline).unwrap_err())
+            }
+        }
         Err(e) => {
             let protocol = wire_kind(&e);
-            recheck_after_handoff(admitted, current, cancel, deadline)?;
-            let slot_wall = SystemTime::now();
-            let slot_mono = Instant::now();
-            let slot_bytes = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await.map_err(|err| map_read_error(err, admitted))?;
-            let pv_wall = SystemTime::now();
-            let pv_mono = Instant::now();
-            let pv_bytes = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await.map_err(|err| map_read_error(err, admitted))?;
+            let _post_err = recheck_after_handoff(admitted, current, cancel, deadline);
+            let slot_res = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await;
+            let (slot_wall, slot_mono) = receipt_now();
+            let pv_res = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await;
+            let (pv_wall, pv_mono) = receipt_now();
+            let slot = match slot_res { Ok(b) => SlotReadback::new(b, slot_wall, slot_mono), Err(_) => SlotReadback::invalid(slot_wall, slot_mono) };
+            let pv = match pv_res { Ok(b) => PvReadback::new(b, pv_wall, pv_mono), Err(_) => PvReadback::invalid(pv_wall, pv_mono) };
             let audit = Audit::new(fixture.sent_count());
-            Ok(Outcome::new(admitted, protocol, SlotReadback::new(slot_bytes, slot_wall, slot_mono), PvReadback::new(pv_bytes, pv_wall, pv_mono), Feedback::unavailable(), audit))
+            Ok(Outcome::new(admitted, protocol, slot, pv, Feedback::unavailable(), audit))
         }
     }
 }
@@ -667,33 +643,58 @@ pub(crate) async fn execute_release(
     assert_eq!(write.value(), &[0x00]);
     match confirmed_write(fixture, &write, cancel, deadline, route).await {
         Ok(()) => {
-            recheck_after_handoff(admitted, current, cancel, deadline)?;
-            let slot_wall = SystemTime::now();
-            let slot_mono = Instant::now();
-            let slot_bytes = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await.map_err(|e| map_read_error(e, admitted))?;
-            let pv_wall = SystemTime::now();
-            let pv_mono = Instant::now();
-            let pv_bytes = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await.map_err(|e| map_read_error(e, admitted))?;
+            let _post_ack = recheck_after_handoff(admitted, current, cancel, deadline);
+            let slot_res = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await;
+            let (slot_wall, slot_mono) = receipt_now();
+            let pv_res = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await;
+            let (pv_wall, pv_mono) = receipt_now();
+            let _post_read = recheck_after_handoff(admitted, current, cancel, deadline);
+            let slot = match slot_res { Ok(b) => SlotReadback::new(b, slot_wall, slot_mono), Err(_) => SlotReadback::invalid(slot_wall, slot_mono) };
+            let pv = match pv_res { Ok(b) => PvReadback::new(b, pv_wall, pv_mono), Err(_) => PvReadback::invalid(pv_wall, pv_mono) };
             let audit = Audit::new(fixture.sent_count());
-            Ok(Outcome::new(admitted, ProtocolResult::Confirmed, SlotReadback::new(slot_bytes, slot_wall, slot_mono), PvReadback::new(pv_bytes, pv_wall, pv_mono), Feedback::unavailable(), audit))
+            Ok(Outcome::new(admitted, ProtocolResult::Confirmed, slot, pv, Feedback::unavailable(), audit))
         }
         Err(e) if is_timeout_abort(&e) => Err(DispatchError::Unknown {
             operation: admitted.operation().as_str().to_string(),
             attempt: admitted.attempt().as_str().to_string(),
             detail: "uncertain-not-resend: release lost; reconcile, do not resend".to_string(),
         }),
-        Err(e) if matches!(e, WireError::Encoding(_)) && cancel.check(deadline).is_err() => Err(cancel.check(deadline).unwrap_err()),
+        Err(e) if matches!(e, WireError::Encoding(_)) && cancel.check(deadline).is_err() => {
+            if emission_established(fixture.sent_count()) {
+                Err(DispatchError::Unknown { operation: admitted.operation().as_str().to_string(), attempt: admitted.attempt().as_str().to_string(), detail: "uncertain-not-resend: cancel raced release send; reconcile, do not resend".to_string() })
+            } else {
+                Err(cancel.check(deadline).unwrap_err())
+            }
+        }
         Err(e) => {
             let protocol = wire_kind(&e);
-            recheck_after_handoff(admitted, current, cancel, deadline)?;
-            let slot_wall = SystemTime::now();
-            let slot_mono = Instant::now();
-            let slot_bytes = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await.map_err(|err| map_read_error(err, admitted))?;
-            let pv_wall = SystemTime::now();
-            let pv_mono = Instant::now();
-            let pv_bytes = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await.map_err(|err| map_read_error(err, admitted))?;
+            let _post_err = recheck_after_handoff(admitted, current, cancel, deadline);
+            let slot_res = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await;
+            let (slot_wall, slot_mono) = receipt_now();
+            let pv_res = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await;
+            let (pv_wall, pv_mono) = receipt_now();
+            let slot = match slot_res { Ok(b) => SlotReadback::new(b, slot_wall, slot_mono), Err(_) => SlotReadback::invalid(slot_wall, slot_mono) };
+            let pv = match pv_res { Ok(b) => PvReadback::new(b, pv_wall, pv_mono), Err(_) => PvReadback::invalid(pv_wall, pv_mono) };
             let audit = Audit::new(fixture.sent_count());
-            Ok(Outcome::new(admitted, protocol, SlotReadback::new(slot_bytes, slot_wall, slot_mono), PvReadback::new(pv_bytes, pv_wall, pv_mono), Feedback::unavailable(), audit))
+            Ok(Outcome::new(admitted, protocol, slot, pv, Feedback::unavailable(), audit))
         }
     }
+}
+/// Authorized outcome inspection for identical retries: read-only slot+PV (no
+/// WriteProperty), never a new physical attempt. Requires exact lossless identity.
+pub(crate) async fn inspect_identical(admitted: &Admitted, preview: &Preview, current: &Current, route: &FrozenRoute, cancel: &DispatchCancel, deadline: Instant, fixture: &Fixture) -> std::result::Result<Outcome, DispatchError> {
+    check_frozen_preview(preview)?;
+    verify_content(admitted, preview, current, route)?;
+    verify_generation(admitted, current)?;
+    cancel.check(deadline)?;
+    if !super::is_identical_retry(admitted, preview) {
+        return Err(DispatchError::Invalid("not identical retry: bits/kind/target differ"));
+    }
+    let slot_res = confirmed_read(fixture, FROZEN_SLOT_PROPERTY, Some(u32::from(FROZEN_PRIORITY)), cancel, deadline, route).await;
+    let (slot_wall, slot_mono) = receipt_now();
+    let pv_res = confirmed_read(fixture, FROZEN_PROPERTY, None, cancel, deadline, route).await;
+    let (pv_wall, pv_mono) = receipt_now();
+    let slot = match slot_res { Ok(b) => SlotReadback::new(b, slot_wall, slot_mono), Err(_) => SlotReadback::invalid(slot_wall, slot_mono) };
+    let pv = match pv_res { Ok(b) => PvReadback::new(b, pv_wall, pv_mono), Err(_) => PvReadback::invalid(pv_wall, pv_mono) };
+    Ok(Outcome::new(admitted, ProtocolResult::Confirmed, slot, pv, Feedback::unavailable(), Audit::new(fixture.sent_count())))
 }
