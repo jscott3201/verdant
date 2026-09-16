@@ -284,3 +284,46 @@ pub fn authorize_cancel(expected_generation: u32, current_generation: u32) -> Re
         })
     }
 }
+
+/// Assess the durable 5s deadline wall anchored to admission `created_secs`.
+/// Pure (no I/O): callers supply the durable anchor read from the Journal
+/// plus the current wall. Rollback (`now < created`) is indeterminate (never
+/// a renewed window); elapsed at or beyond the deadline is expired; otherwise
+/// active. A delayed queue plus a fresh `Instant` cannot renew this wall.
+pub fn assess_deadline_wall(created_secs: i64, now_secs: i64, deadline_secs: u64) -> ExpiryState {
+    let elapsed = match now_secs.checked_sub(created_secs) {
+        None => return ExpiryState::Indeterminate { reason: "wall-rollback" },
+        Some(delta) => delta,
+    };
+    if elapsed < 0 {
+        return ExpiryState::Indeterminate { reason: "wall-rollback" };
+    }
+    let elapsed_u = match u64::try_from(elapsed) {
+        Ok(value) => value,
+        Err(_) => return ExpiryState::Indeterminate { reason: "wall-rollback" },
+    };
+    if elapsed_u >= deadline_secs {
+        ExpiryState::Expired { elapsed_secs: elapsed_u, duration_secs: deadline_secs }
+    } else {
+        ExpiryState::Active
+    }
+}
+
+/// Gate a new SET on the durable deadline wall plus the existing
+/// expiry/freshness verdict. Only wall-Active plus `Active` plus `Fresh`
+/// proceeds; wall-expired and any wall-indeterminate refuse as expired or
+/// indeterminate. Enforcement stays here as a pure decision; durable reads
+/// stay with the Journal/custody owner (no SQL in this table).
+pub fn decide_set_with_wall_anchor(
+    expiry: &ExpiryState,
+    freshness: Freshness,
+    created_secs: i64,
+    now_secs: i64,
+    deadline_secs: u64,
+) -> Result<()> {
+    match assess_deadline_wall(created_secs, now_secs, deadline_secs) {
+        ExpiryState::Active => decide_set_allowed(expiry, freshness),
+        ExpiryState::Expired { elapsed_secs, duration_secs } => Err(ExpiryError::Expired { elapsed_secs, duration_secs }),
+        ExpiryState::Indeterminate { reason } => Err(ExpiryError::Indeterminate { reason }),
+    }
+}

@@ -57,6 +57,31 @@ pub fn authorize_release(
     _expiry: &ExpiryState,
     _freshness: Freshness,
 ) -> Result<FrozenWrite> {
+    authorize_release_with_wall(admitted, preview, current, route, cancel, deadline, _expiry, _freshness, admitted.created_secs(), admitted.created_secs())
+}
+
+/// Authorize one frozen NULL release against a durable wall anchor. Consumes
+/// the admitted horizon plus the durable `created` anchor read by the owner;
+/// wall-expired or wall-indeterminate still permits an admitted NULL release
+/// (constrained cleanup stays exempt), while wrong target/generation or a
+/// non-admitted NULL refuses. Pure decision (no I/O); durable reads stay
+/// with the Journal/custody owner.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_release_with_wall(
+    admitted: &Admitted,
+    preview: &Preview,
+    current: &Current,
+    route: &FrozenRoute,
+    cancel: &DispatchCancel,
+    deadline: Instant,
+    _expiry: &ExpiryState,
+    _freshness: Freshness,
+    created_secs: i64,
+    now_secs: i64,
+) -> Result<FrozenWrite> {
+    // Wall anchor is consumed (proves the horizon was consulted) but never
+    // gates an admitted NULL: expiry/indeterminate still permits cleanup.
+    let _wall = super::policy::assess_deadline_wall(created_secs, now_secs, admitted.deadline_secs());
     let write =
         crate::action_dispatch::prepare_release(admitted, preview, current, route, cancel, deadline)
             .map_err(ExpiryError::from)?;

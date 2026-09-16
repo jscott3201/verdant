@@ -212,7 +212,7 @@ fn same_key_same_payload_retry_reconciles() {
     assert_eq!(journal.essential_announced(), 1);
     assert_eq!(
         raw(&scratch.db(), "SELECT generation FROM schema_migrations ORDER BY generation;"),
-        "1\n2\n3\n4\n5\n"
+        "1\n2\n3\n4\n5\n6\n"
     );
     assert_eq!(raw(&scratch.db(), "PRAGMA user_version;"), "1\n");
 }

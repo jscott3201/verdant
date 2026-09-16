@@ -105,8 +105,9 @@ pub mod policy;
 pub use custody::{
     authorize_cancel_via_custody, authorize_constrained_cleanup,
     authorize_release_via_custody, authorize_setpoint_via_custody, cancel_pending,
-    inspect_outstanding, is_same_record, recheck_after_handoff_via_custody,
-    reconcile_journal_via_custody, reconcile_pending_release_via_custody,
+    inspect_outstanding, inspect_outstanding_bounded, is_same_record,
+    recheck_after_handoff_via_custody, reconcile_journal_via_custody,
+    reconcile_pending_release_via_custody,
     require_activation_current_for_handoff_via_custody,
     require_aliases_unique_via_custody, require_peer_accepted_before_journal_via_custody,
     require_same_observation_via_custody, slot_value_proves_ownership_via_custody,
