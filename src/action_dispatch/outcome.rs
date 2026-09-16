@@ -3,6 +3,17 @@
 //! Separate times per property, never an atomic controller snapshot.
 //! `source_time` stays `None`; no `ObservedQualified` is minted. One logical
 //! call is audited against effective wire sends; effective retries stay `0`.
+//!
+//! Slice D no-receipt-after-restart rule (memory-only, no fabrication):
+//! `SlotReadback`/`PvReadback` `receipt_wall`/`receipt_monotonic` are captured
+//! via `receipt_now()` AFTER each read response arrives (response-correlated,
+//! independent per property) and live only in the in-memory `Outcome`. No
+//! receipt/outcome durable column exists (no `0007`); a reopened `Admitted`
+//! exposes no receipt accessors. Fresh processes re-observe via read-only
+//! `inspect_identical` (no second `WriteProperty`) with fresh `receipt_now`
+//! times (never equal to pre-kill times) and `source_time` staying `None`.
+//! Never copy old receipt times into a new outcome; never invent
+//! `source_time`.
 
 use super::{DISPATCH_FORMAT, FEEDBACK_STATUS};
 use crate::action_journal::Admitted;

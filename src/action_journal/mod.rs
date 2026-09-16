@@ -137,6 +137,12 @@ pub type Result<T> = std::result::Result<T, WriterError>;
 /// `None` and refuse for new handoffs as stale-payload (readable via
 /// reconcile, no backfill). Slice-B adds the durable lifecycle state,
 /// predecessor obligation link and `created` wall anchor (deadline/rate).
+/// Slice D: no receipt accessors by construction (receipts stay memory-only
+/// in `Outcome`; no receipt/outcome durable columns, no `0007`). A reopened
+/// `Admitted` carries only the wall anchor plus identities; fresh processes
+/// re-observe via read-only `inspect_identical` with fresh times (never equal
+/// to pre-kill times), `source_time` staying `None`; never fabricate receipts
+/// from `created` or prior memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admitted {
     row_id: i64,

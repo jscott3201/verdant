@@ -144,7 +144,8 @@ fn forced_exit_before_commit_is_rollback_nothing_admitted() {
 
 /// Honesty: no child process is involved here; `LostResponse` fault injection
 /// models a lost storage response after commit (UNKNOWN until reconcile).
-/// True post-handoff child-process interruption is Slice D (Sec 7), not here.
+/// True post-handoff child-process interruption is Slice D (Sec 7), proved in
+/// `tests/m02_sliceD_posthandoff_proof.rs`, not here.
 #[test]
 fn lost_response_after_commit_is_unknown_persists_for_reconcile() {
     use storage::sqlite::faults::{inject, Fault};

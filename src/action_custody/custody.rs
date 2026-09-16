@@ -219,6 +219,22 @@ pub fn reconcile_pending_release_via_custody(
     crate::action_recovery::reconcile_pending_release(pending, journal).map_err(CustodyError::from)
 }
 
+/// Rediscover dropped `PendingRelease` obligations via the bounded
+/// outstanding scan, without resending. Thin delegation to the expiry owner
+/// (`release::rediscover_via_outstanding`); adds no guard SQL, no profile
+/// check, no transport. Memory-only: the `PendingRelease` object may be
+/// dropped; all fields stay durable in the journal rows and are rediscovered
+/// here with the cleanup obligation still discoverable.
+pub fn rediscover_obligations_via_custody(
+    journal: &Journal,
+    scope: &TrustedScope,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Admitted>> {
+    crate::action_expiry::release::rediscover_via_outstanding(journal, scope, limit, offset)
+        .map_err(CustodyError::from)
+}
+
 /// Transfer-narrow via NEW admission (TRANSFER NARROW): move unresolved
 /// responsibility from an expired/offboarded actor to an active permitted
 /// role. Long reads (old reconcile is caller-supplied via `old`) happen
