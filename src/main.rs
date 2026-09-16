@@ -53,6 +53,9 @@ mod action_recovery;
 // M02-PR09 publication, replacement and exclusion (harness-only; no CLI change here).
 #[allow(dead_code)]
 mod action_publication;
+// M02-PR12 maintenance, offboarding and current custody (harness-only; no CLI change here).
+#[allow(dead_code)]
+mod action_custody;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
