@@ -34,13 +34,43 @@
 //! `verdant run` never constructs the network path. No new migration (wall
 //! uses existing `created`, lifecycle uses the 0006 table, seal join is
 //! call-level). Frozen numbers unchanged.
+//!
+//! Slice D post-handoff durability (outside harness, same ordering discipline
+//! as `mark_dispatched`-before-send): the harness stays network-only (send +
+//! readbacks, no SQL); the joined owner durably marks AFTER the harness
+//! returns, never under network. `Unknown`/lost (timeout/abort/kill before
+//! persist, `dispatch-unknown`) marks `Unresolved` (honest, never resend);
+//! `Confirmed` (`ProtocolResult::Confirmed`) marks `Terminal` (history stays
+//! reconcile-readable, no blind resend). No new table/column/migration;
+//! writes go only through `Journal::mark_terminal`/`mark_unresolved` (guarded
+//! lifecycle batches).
+//!
+//! Restart conservatism (decision lives here): a fresh process observing
+//! `Dispatched` treats it conservatively as `Unresolved` until qualified
+//! recovery (peer + transport reconciled, see `is_conservatively_unresolved`
+//! and `refuse_resend_without_qualified_recovery`). `Dispatched` means the
+//! send left the writer but no outcome was durably recorded; the peer may or
+//! may not have accepted. Never invent `Terminal`/`Confirmed` from
+//! `Dispatched` alone.
+//!
+//! Receipt honesty: `Outcome` receipts (`SlotReadback`/`PvReadback`
+//! `receipt_wall`/`receipt_monotonic`) stay memory-only (no receipt/outcome
+//! durable columns, no `0007`). A reopened `Admitted` exposes no receipt
+//! accessors; fresh processes re-observe via read-only `inspect_identical`
+//! with fresh `receipt_now` times (never equal to pre-kill times) and
+//! `source_time` staying `None`. See `outcome.rs` and `Admitted` docs.
+//!
+//! PendingRelease stays memory-only: obligations are rediscovered via the
+//! existing bounded `outstanding_page` -> `reconcile` scan (all fields already
+//! durable); the dropped-object path is proved in Slice D tests. No
+//! `PendingRelease` table, no resend.
 
 use crate::accept::AcceptanceStore;
 use crate::access::RoleKind;
 use crate::action_custody::{CustodyError, ScopeHolds};
-use crate::action_dispatch::{Current, DispatchCancel, FrozenRoute, FrozenWrite};
+use crate::action_dispatch::{Current, DispatchCancel, FrozenRoute, FrozenWrite, Outcome, ProtocolResult};
 use crate::action_expiry::ExpiryState;
-use crate::action_journal::{Admitted, Journal};
+use crate::action_journal::{Admitted, Journal, LifecycleState};
 use crate::action_preview::{Preview, PreviewError};
 use crate::action_publication::{ImpactGate, OldWriterExclusion};
 use crate::domain::ids::OperationId;
@@ -192,6 +222,99 @@ pub fn authorize_joined_release(
         is_revoked,
         impact,
     )
+}
+
+/// Record a confirmed harness outcome durably as terminal, outside harness.
+/// Only `ProtocolResult::Confirmed` maps here; any other peer-responded
+/// outcome (remote error/reject/abort/timeout/invalid/transport) or lost
+/// response must use [`record_unknown_unresolved`] plus qualified recovery,
+/// never an invented terminal. Identity-checked (operation/attempt/scope/
+/// equipment/generations/revisions must match `admitted`); no network runs
+/// here, only the guarded lifecycle batch. Harness stays network-only.
+pub fn record_confirmed_terminal(
+    journal: &Journal,
+    admitted: &Admitted,
+    outcome: &Outcome,
+) -> Result<Admitted> {
+    if outcome.operation() != admitted.operation().as_str()
+        || outcome.attempt() != admitted.attempt().as_str()
+        || outcome.scope() != admitted.scope().as_str()
+        || outcome.equipment() != admitted.equipment().as_str()
+        || outcome.binding_revision() != admitted.binding_revision().as_u32()
+        || outcome.accepted_revision() != admitted.accepted_revision().get()
+        || outcome.target_generation() != admitted.target_generation()
+    {
+        return Err(CustodyError::Invalid("outcome identity differs from admitted"));
+    }
+    // Exhaustive: new protocol variants break the build, never invent terminal.
+    match outcome.protocol() {
+        ProtocolResult::Confirmed => {}
+        ProtocolResult::RemoteError { .. }
+        | ProtocolResult::Reject(_)
+        | ProtocolResult::Abort(_)
+        | ProtocolResult::Timeout
+        | ProtocolResult::InvalidReply
+        | ProtocolResult::TransportFailure => {
+            return Err(CustodyError::Invalid(
+                "only Confirmed maps to terminal; other outcomes need qualified recovery via unresolved",
+            ));
+        }
+    }
+    journal
+        .mark_terminal(admitted.operation(), admitted.scope())
+        .map_err(CustodyError::from)
+}
+
+/// Record an unknown/lost harness outcome durably as unresolved, outside
+/// harness. Call when the harness returned `DispatchError::Unknown`
+/// (timeout/abort/lost response, `uncertain-not-resend`), when the child was
+/// killed after peer accept before any mark, or when cancellation raced the
+/// send with emission established. Honest, never a resend: the obligation
+/// stays outstanding and discoverable via the bounded scan; a second
+/// `execute_*` must refuse via [`refuse_resend_without_qualified_recovery`]
+/// (or the terminal lifecycle gate) and only read-only `inspect_identical`
+/// may re-observe. No network runs here.
+pub fn record_unknown_unresolved(
+    journal: &Journal,
+    admitted: &Admitted,
+) -> Result<Admitted> {
+    journal
+        .mark_unresolved(admitted.operation(), admitted.scope())
+        .map_err(CustodyError::from)
+}
+
+/// Restart conservatism: `Dispatched` and `Unresolved` are both treated as
+/// unresolved until qualified recovery (peer state plus transport ownership
+/// reconciled first). A fresh process must never treat persisted `Dispatched`
+/// as success, failure, or permission to resend; it is uncertain. `Admitted`
+/// (pre-send) is not yet sent; `Terminal` is final history.
+pub fn is_conservatively_unresolved(admitted: &Admitted) -> bool {
+    // Exhaustive: new lifecycle variants break the build, never default.
+    match admitted.lifecycle() {
+        LifecycleState::Dispatched | LifecycleState::Unresolved => true,
+        LifecycleState::Admitted | LifecycleState::Terminal => false,
+    }
+}
+
+/// Refuse any resend without qualified recovery. `Admitted` (pre-send) may
+/// proceed to the first handoff; `Dispatched`/`Unresolved` refuse as
+/// `custody-unknown` (uncertain-not-resend: reconcile peer + transport first,
+/// use read-only `inspect_identical`, never a second `WriteProperty`);
+/// `Terminal` refuses as `custody-conflict` (final history, reconcile only).
+/// This is the joined-path resend brake outside harness; the dispatch
+/// lifecycle gate (`Terminal` final) remains the second brake for terminal.
+pub fn refuse_resend_without_qualified_recovery(admitted: &Admitted) -> Result<()> {
+    match admitted.lifecycle() {
+        LifecycleState::Admitted => Ok(()),
+        LifecycleState::Dispatched | LifecycleState::Unresolved => Err(CustodyError::Unknown {
+            operation: admitted.operation().as_str().to_string(),
+            attempt: admitted.attempt().as_str().to_string(),
+            detail: "uncertain-not-resend: Dispatched/Unresolved after handoff; qualified recovery required before any resend; use read-only inspect_identical".to_string(),
+        }),
+        LifecycleState::Terminal => Err(CustodyError::Conflict {
+            detail: "lifecycle terminal is final; reconcile history, do not resend".to_string(),
+        }),
+    }
 }
 
 /// Seal gate for the joined path: only the real S03 verified join passes

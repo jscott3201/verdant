@@ -171,3 +171,29 @@ impl PendingRelease {
             .map_err(ExpiryError::from)
     }
 }
+
+/// Rediscover dropped `PendingRelease` obligations via the existing bounded
+/// `outstanding_page` -> `reconcile` scan, without resending.
+///
+/// Memory-only rule (owner decision, no `0007`): `PendingRelease` holds no
+/// durable keys and persists no table/column; all fields (operation/attempt/
+/// scope/equipment/revisions/generations) are already durable in the journal
+/// rows. Dropping the object loses nothing durable: a fresh process with no
+/// old Rust objects rediscovers the same identities through this scan. The
+/// dropped-object path is proved in Slice D tests (construct via
+/// `from_admitted`, `drop`, rediscover here, assert identities + cleanup
+/// obligation discoverable, `sent_count` unchanged, no second
+/// `WriteProperty`). Read-only recovery; cross-scope callers observe nothing.
+pub fn rediscover_via_outstanding(
+    journal: &Journal,
+    scope: &TrustedScope,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Admitted>> {
+    // `outstanding_page` already hydrates each operation through the scoped
+    // join (state-filtered, terminal excluded, exact scope, bounded LIMIT).
+    // No send, no mark, no resend happens here.
+    journal
+        .outstanding_page(scope, limit, offset)
+        .map_err(ExpiryError::from)
+}
