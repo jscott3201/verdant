@@ -269,7 +269,11 @@ fn stale_activation_one_cas_winner_history_never_restores() {
     assert_eq!(active.revision().get(), 1);
     assert_eq!(active.request().acceptance().seal(), sealed.identity());
     // Publication currency mirrors the same verdicts without auto-promotion.
-    assert!(action_publication::require_activation_current_for_handoff(&reopened, &fixture::scope(), sealed2.config().binding_revision(), accept::AcceptedRevision::new(2).expect("rev2")).is_ok());
+    // Slice-A active barrier: rev2 is current but NOT active (active stays
+    // rev1), so it blocks as newer-accepted/older-active until activation;
+    // rev1 is stale-admitted and stays superseded. `Current` swaps cannot
+    // substitute for the durable active pointer (see Slice-A regressions).
+    assert_eq!(action_publication::require_activation_current_for_handoff(&reopened, &fixture::scope(), sealed2.config().binding_revision(), accept::AcceptedRevision::new(2).expect("rev2")).unwrap_err().code(), "publication-blocked");
     assert_eq!(action_publication::require_activation_current_for_handoff(&reopened, &fixture::scope(), sealed.config().binding_revision(), accept::AcceptedRevision::new(1).expect("rev1")).unwrap_err().code(), "activation-superseded");
 }
 

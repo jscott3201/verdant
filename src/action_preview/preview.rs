@@ -167,6 +167,11 @@ impl ReleasePlan {
     pub fn target(&self) -> &InstalledId {
         &self.target
     }
+    /// Whether this preview authorizes a NULL release. Presentation
+    /// (`on_expiry`) is constant; this flag is lossless identity, not display.
+    pub fn admitted(&self) -> bool {
+        self.admitted
+    }
     pub fn on_expiry(&self) -> &'static str {
         "null-relinquish"
     }
@@ -472,6 +477,10 @@ impl Preview {
     }
 
     /// Deterministic canonical bytes (field order frozen) for evidence.
+    /// PRESENTATION-ONLY: `{:.4}` text plus constant `on_expiry` intentionally
+    /// omit lossless identity. Distinct binary32 values sharing 4-decimal text
+    /// (e.g. 22.00001 vs 22.00002) MUST NOT reconcile as same payload; use
+    /// [`Self::identity_bytes`] plus journal wire_bits/kind/target for handoffs.
     pub fn canonical_bytes(&self) -> String {
         format!(
             "{}|{}|{}|{}|{}|p{}|av{}:pv{}|{}|{:.4}|{}|{}s|{}s|r{}|age{}|{}|{}",
@@ -492,6 +501,47 @@ impl Preview {
             self.precondition_age_secs,
             self.feedback.status(),
             self.release.on_expiry(),
+        )
+    }
+
+    /// Lossless action kind: `release` when a NULL release is explicitly
+    /// admitted, otherwise `set`. Distinct from presentation `on_expiry`.
+    pub fn action_kind(&self) -> &'static str {
+        if self.release.admitted() {
+            "release"
+        } else {
+            "set"
+        }
+    }
+
+    /// Authorized release target for this preview (obligation reference).
+    /// SET previews still carry the preview release target; journal persists
+    /// it so a later target change refuses instead of retargeting.
+    pub fn release_target(&self) -> &InstalledId {
+        self.release.target()
+    }
+
+    /// Whether this preview admits a NULL release (lossless, not display).
+    pub fn release_admitted(&self) -> bool {
+        self.release.admitted()
+    }
+
+    /// Lossless identity for admission/handoff comparison (field order frozen).
+    /// Presentation `canonical_bytes` plus exact `wire_bits` (binary32, not
+    /// `{:.4}`), explicit kind (`set` vs `release`), release admission flag
+    /// and authorized release target. Two previews with equal presentation
+    /// but different bits/kind/target have different identity and MUST NOT
+    /// reconcile. Identical retries (equal identity) are authorized outcome
+    /// inspection, not a new physical attempt (see Slice B TODO in journal).
+    pub fn identity_bytes(&self) -> String {
+        format!(
+            "{}|bits{:08X}|kind:{}|rel:{}:{}|{}",
+            PREVIEW_FORMAT,
+            self.encoded.wire_bits(),
+            self.action_kind(),
+            u8::from(self.release.admitted()),
+            self.release.target().as_str(),
+            self.canonical_bytes(),
         )
     }
 }

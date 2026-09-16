@@ -11,6 +11,7 @@ const NOTE_1: &str = "M01-PR03 0001_init: initial tiny outbox";
 const NOTE_2: &str = "R03 0002_receipts: admission and reconciliation";
 const NOTE_3: &str = "M02-PR03B 0003_observations: finite window and custody";
 const NOTE_4: &str = "M02-PR06 0004_action_journal: durable admission and per-target state";
+const NOTE_5: &str = "M02-SliceA 0005_action_identity: lossless wire identity and kind";
 // Complete ordered schema, one framed result: additive tables must not spend
 // the existing consumers' per-operation row budget before their bounded read.
 // No objects/DDL bytes are omitted; execution byte limits still apply in full.
@@ -90,18 +91,19 @@ fn parent_path(path: &Path) -> Result<PathBuf, StorageError> {
 }
 
 type Objects = Vec<Vec<String>>;
-fn reference_objects() -> Result<&'static (Objects, Objects, Objects, Objects), StorageError> {
-    static OBJECT_CACHE: OnceLock<Result<(Objects, Objects, Objects, Objects), StorageError>> = OnceLock::new();
+fn reference_objects() -> Result<&'static (Objects, Objects, Objects, Objects, Objects), StorageError> {
+    static OBJECT_CACHE: OnceLock<Result<(Objects, Objects, Objects, Objects, Objects), StorageError>> = OnceLock::new();
     OBJECT_CACHE.get_or_init(|| {
-        let script = format!("{}\n{OBJECTS}\nSELECT 'NEXT';\n{}\n{OBJECTS}\nSELECT 'NEXT';\n{}\n{OBJECTS}\nSELECT 'NEXT';\n{}\n{OBJECTS}", super::super::MIGRATION_0001_SQL, super::super::MIGRATION_0002_SQL, super::super::MIGRATION_0003_SQL, super::super::MIGRATION_0004_SQL);
+        let script = format!("{}\n{OBJECTS}\nSELECT 'NEXT';\n{}\n{OBJECTS}\nSELECT 'NEXT';\n{}\n{OBJECTS}\nSELECT 'NEXT';\n{}\n{OBJECTS}\nSELECT 'NEXT';\n{}\n{OBJECTS}", super::super::MIGRATION_0001_SQL, super::super::MIGRATION_0002_SQL, super::super::MIGRATION_0003_SQL, super::super::MIGRATION_0004_SQL, super::super::MIGRATION_0005_SQL);
         let output = run_script_stdin(Path::new(":memory:"), &["-separator", "|"], &script)?;
         if !output.status.success() { return Err(failure("reference schema construction failed")); }
         let text = String::from_utf8(output.stdout).map_err(|_| failure("reference schema encoding"))?;
         let (old, rest) = text.split_once("NEXT\n").ok_or_else(|| failure("reference schema framing"))?;
         let (middle, rest) = rest.split_once("NEXT\n").ok_or_else(|| failure("reference schema 0003 framing"))?;
-        let (new3, new4) = rest.split_once("NEXT\n").ok_or_else(|| failure("reference schema 0004 framing"))?;
+        let (new3, rest) = rest.split_once("NEXT\n").ok_or_else(|| failure("reference schema 0004 framing"))?;
+        let (new4, new5) = rest.split_once("NEXT\n").ok_or_else(|| failure("reference schema 0005 framing"))?;
         let rows = |text: &str| text.lines().map(|l| l.split('|').map(str::to_owned).collect()).collect();
-        Ok((rows(old), rows(middle), rows(new3), rows(new4)))
+        Ok((rows(old), rows(middle), rows(new3), rows(new4), rows(new5)))
     }).as_ref().map_err(Clone::clone)
 }
 
@@ -110,17 +112,18 @@ pub(super) fn scalar(rows: Vec<Vec<String>>) -> Result<String, StorageError> {
     Ok(rows[0][0].clone())
 }
 
-/// Returns None only for exactly supported 0001/0002 predecessors. Both 0003
-/// and writer-gated 0004 are valid currents (fresh open stays at 0003 until
-/// the M02-PR06 writer ensure applies 0004). No DDL here.
+/// Returns None only for exactly supported 0001/0002 predecessors. 0003,
+/// writer-gated 0004 and Slice-A 0005 are valid currents (fresh open stays at
+/// 0003 until the M02-PR06/Slice-A writer ensures apply 0004 then 0005).
+/// No DDL here.
 pub(super) fn validate(conn: &mut Connection) -> Result<Option<String>, StorageError> {
     let generation = scalar(conn.exchange("PRAGMA user_version;")?)?;
     if generation != SCHEMA_GENERATION.to_string() {
         return Err(StorageError::SchemaMismatch { expected: SCHEMA_GENERATION, found: generation });
     }
     let objects = conn.exchange(OBJECTS)?;
-    let (old, middle, new3, new4) = reference_objects()?;
-    if objects != *old && objects != *middle && objects != *new3 && objects != *new4 { return Err(failure("schema objects differ; refusing without repair")); }
+    let (old, middle, new3, new4, new5) = reference_objects()?;
+    if objects != *old && objects != *middle && objects != *new3 && objects != *new4 && objects != *new5 { return Err(failure("schema objects differ; refusing without repair")); }
     let ledger = conn.exchange("SELECT generation, hex(applied_note) FROM schema_migrations ORDER BY generation;")?;
     let note = |n: u32, s: &str| vec![n.to_string(), super::mutation::hex(s.as_bytes())];
     let app = scalar(conn.exchange("PRAGMA application_id;")?)?;
@@ -128,7 +131,8 @@ pub(super) fn validate(conn: &mut Connection) -> Result<Option<String>, StorageE
     let predecessor = objects == *middle && ledger == vec![note(1, NOTE_1), note(2, NOTE_2)];
     let current3 = objects == *new3 && ledger == vec![note(1, NOTE_1), note(2, NOTE_2), note(3, NOTE_3)];
     let current4 = objects == *new4 && ledger == vec![note(1, NOTE_1), note(2, NOTE_2), note(3, NOTE_3), note(4, NOTE_4)];
-    if (!predecessor && !current3 && !current4) || app != "1447383636" {
+    let current5 = objects == *new5 && ledger == vec![note(1, NOTE_1), note(2, NOTE_2), note(3, NOTE_3), note(4, NOTE_4), note(5, NOTE_5)];
+    if (!predecessor && !current3 && !current4 && !current5) || app != "1447383636" {
         return Err(StorageError::SchemaMismatch { expected: SCHEMA_GENERATION, found: "unsupported migration ledger/application identity".into() });
     }
     let identity = scalar(conn.exchange("SELECT identity FROM storage_identity WHERE singleton=1;")?)?;

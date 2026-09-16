@@ -127,13 +127,37 @@ pub fn require_peer_accepted_before_journal_via_publication(
         .map_err(PublicationError::from)
 }
 
-/// Require the admitted revisions to match the currently accepted
-/// publication before a new handoff. Reads the current accepted event plus
-/// its staged configuration (long reads, no transaction) and refuses stale
-/// or foreign revisions: a superseded acceptance refuses with the preserved
-/// `activation-superseded` code, a binding-revision drift blocks with
-/// `publication-blocked` until the new publication is accepted. Never
-/// auto-promotes, never restores a superseded pointer.
+/// Require the admitted revisions to match the currently ACTIVE publication
+/// before a new handoff. Reads the durable active pointer PLUS the current
+/// accepted event and its staged configuration (long reads, no transaction)
+/// and refuses stale or foreign revisions. Never auto-promotes, never
+/// restores a superseded pointer.
+///
+/// Pre/post generation (traced, not ±1): `AcceptedRevision::INITIAL` is the
+/// pre-admission expectation; `revision = expected.next()` is the
+/// post-CAS accepted value. `ActiveGeneration::INITIAL` is the pre-activation
+/// token; `generation = expected.next()` is the post-CAS active value. This
+/// gate compares post-CAS revisions (`current.revision`, `active.revision`)
+/// to the admitted post-CAS revision, not pre tokens. Replacement/release
+/// tracing (old-target pin, NULL reveal) lives with the active join; do not
+/// fix mismatches by ±1 without that trace.
+///
+/// Barriers on owning ops, not `Current` swaps: this check reads the durable
+/// `AcceptanceStore::active`/`current` directly. Caller-supplied `Current`
+/// values (actor/ceiling/revisions) cannot substitute for it; ordinary
+/// dispatch `prepare_*` without this barrier is harness-only and proves
+/// nothing about activation. Tests assert `Current` swaps still refuse here.
+///
+/// Cases (distinguished, not collapsed):
+/// - no current: `accept-invalid` (activation requires committed acceptance);
+/// - admitted != current: `activation-superseded` (stale admitted);
+/// - current exists but no active: `activation-superseded` with
+///   `accepted-but-not-active` detail (accepted, never activated);
+/// - admitted == current but active older (newer-accepted/older-active):
+///   `activation-superseded` with `older-active` detail (activate current);
+/// - admitted == active but != current is already stale-admitted above;
+/// - binding drift: `publication-blocked` until the new publication is
+///   accepted AND activated.
 pub fn require_activation_current_for_handoff(
     store: &AcceptanceStore,
     scope: &crate::domain::scope::TrustedScope,
@@ -156,6 +180,40 @@ pub fn require_activation_current_for_handoff(
                 current: current.revision,
             },
         ));
+    }
+    // Durable active pointer: accepted-but-not-active must not dispatch.
+    let active = store.active(scope).map_err(PublicationError::from_accept)?;
+    let active = match active {
+        Some(activated) => activated,
+        None => {
+            return Err(PublicationError::from_accept(crate::accept::Error::Invalid(
+                "accepted-but-not-active; activate current publication before handoff",
+            )));
+        }
+    };
+    // Active must join the same accepted revision the admission was bound to.
+    // Newer-accepted/older-active (current rev N, active rev N-1 with admitted
+    // N) refuses as blocked until the current publication is activated, even
+    // though admitted == current: the current publication is not yet active.
+    // Older admitted (admitted != current) already refused above; an active
+    // older than admitted is the same older-active refusal when admitted ==
+    // current. Distinct codes preserve the distinction (blocked vs superseded).
+    if active.revision() != admitted_accepted_revision {
+        return Err(PublicationError::Blocked {
+            detail: format!(
+                "newer-accepted/older-active: admitted rev {} != active rev {}; activate current rev {} before handoff",
+                admitted_accepted_revision.get(),
+                active.revision().get(),
+                current.revision.get(),
+            ),
+        });
+    }
+    // Active generation must be non-zero (at least one activation CAS won);
+    // INITIAL (0) with a revision present is a corrupt join, not a bypass.
+    if active.generation().get() == 0 {
+        return Err(PublicationError::from_accept(crate::accept::Error::Invalid(
+            "active generation 0 with accepted revision; activate before handoff",
+        )));
     }
     let staged = store
         .read_staged(current.request.staged_operation())
