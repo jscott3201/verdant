@@ -572,7 +572,10 @@ pub(crate) fn verify_generation(admitted: &Admitted, current: &Current) -> Resul
 /// SET-only: a release admission (kind `release`) refuses here; use
 /// `prepare_release` with the identical release preview instead (swapped-kind
 /// barrier, not a preview-only decision).
-pub fn prepare_setpoint(
+/// `pub(crate)`: product and gate callers must use the joined path
+/// (`crate::action_joined::authorize_joined_setpoint`); raw preparation
+/// bypasses the seal/activation/wall barriers. Binary-only, no external consumers.
+pub(crate) fn prepare_setpoint(
     admitted: &Admitted,
     preview: &Preview,
     current: &Current,
@@ -619,7 +622,8 @@ pub fn prepare_setpoint(
 /// match); non-admitted NULL (SET kind via release path) stays
 /// `NullNotAdmitted` via `null_wire`, preserving existing refusal. Release
 /// target change refuses in `verify_content` (no retargeting).
-pub fn prepare_release(
+/// `pub(crate)`: use the joined release path; raw bypasses seal/activation/wall.
+pub(crate) fn prepare_release(
     admitted: &Admitted,
     preview: &Preview,
     current: &Current,

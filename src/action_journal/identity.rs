@@ -15,13 +15,12 @@
 //! not `target`. Replacement/release tracing lives with activation (see
 //! publication); do not adjust by ±1 without that trace.
 //!
-//! TODO(SliceB-deferred, not in this PR): full durable lifecycle (attempt
-//! progression, terminal/unresolved states, bounded outstanding, lost wake-up
-//! recovery beyond identity), owned 6/hour enforcement, durable custody
-//! predecessor link + target-equivalence.
-//! failing-sketch: `Journal::admit` would need `attempt_state` transitions
-//! (`admitted -> dispatched -> terminal`) with bounded outstanding and custody
-//! link; sketch omitted here to avoid half-implementation.
+//! Slice B delivered (no longer deferred): durable lifecycle
+//! (`action_journal/lifecycle.rs` + 0006 `action_lifecycle`), owned 6/hour
+//! enforcement (`action_journal/rate.rs` guarded batch), durable custody
+//! predecessor link + target-equivalence (`admission_body_v2` +
+//! `action_custody/policy.rs::check_transfer_equivalence`). Slice C owns the
+//! seal/joined/wall join on top; see `crate::action_joined`.
 
 use crate::accept::AcceptedRevision;
 use crate::access::{RoleKind, REQUIRED_PUBLISH_CEILING};

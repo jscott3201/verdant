@@ -57,7 +57,15 @@ pub fn authorize_release(
     _expiry: &ExpiryState,
     _freshness: Freshness,
 ) -> Result<FrozenWrite> {
-    authorize_release_with_wall(admitted, preview, current, route, cancel, deadline, _expiry, _freshness, admitted.created_secs(), admitted.created_secs())
+    // Real wall read (not a self-passed anchor): the durable `created` plus
+    // the current wall are consulted, but an admitted NULL stays exempt
+    // (constrained cleanup permits cancel-or-NULL under expired/indeterminate
+    // time; see `authorize_release_with_wall`).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(i64::MIN);
+    authorize_release_with_wall(admitted, preview, current, route, cancel, deadline, _expiry, _freshness, admitted.created_secs(), now_secs)
 }
 
 /// Authorize one frozen NULL release against a durable wall anchor. Consumes

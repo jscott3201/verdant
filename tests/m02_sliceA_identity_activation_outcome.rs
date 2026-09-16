@@ -4,8 +4,9 @@
 //! Frozen profile verbatim: BACnet/IP AV `presentValue` on `tiny_site`
 //! (`ahu-1`/`vav-101`, `scope-a`); AV2/PV85/P8; `degC` 20-24 tol 0.1;
 //! 15min/5s/APDU_RETRIES(0)/6h; PV `unavailable-feedback`, `source_time` None.
-//! Slice B (deferred): full lifecycle, 6/hour enforcement, custody link,
-//! bounded outstanding -- see TODOs in `action_journal/identity.rs`.
+//! Slice B delivered: lifecycle (`action_journal/lifecycle.rs` + 0006),
+//! owned 6/hour (`action_journal/rate.rs`), custody link
+//! (`admission_body_v2`); Slice C owns seal/joined/wall (`action_joined`).
 //! M02-G promotion is HELD (not claimed here).
 #![allow(dead_code)]
 #[path = "../src/domain/mod.rs"]
@@ -42,6 +43,10 @@ mod action_expiry;
 mod action_recovery;
 #[path = "../src/action_publication/mod.rs"]
 mod action_publication;
+#[path = "../src/action_custody/mod.rs"]
+mod action_custody;
+#[path = "../src/action_joined.rs"]
+mod action_joined;
 #[path = "seal_cases/fixture.rs"]
 mod fixture;
 #[path = "accept_cases/support.rs"]

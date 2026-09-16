@@ -103,7 +103,8 @@ pub mod policy;
 
 #[allow(unused_imports)]
 pub use custody::{
-    authorize_cancel_via_custody, authorize_constrained_cleanup,
+    admit_joined_via_custody, authorize_cancel_via_custody, authorize_constrained_cleanup,
+    authorize_joined_release_via_custody, authorize_joined_setpoint_via_custody,
     authorize_release_via_custody, authorize_setpoint_via_custody, cancel_pending,
     inspect_outstanding, inspect_outstanding_bounded, is_same_record,
     recheck_after_handoff_via_custody, reconcile_journal_via_custody,

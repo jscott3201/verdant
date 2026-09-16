@@ -173,7 +173,7 @@ const COMPOSED: &[(&str, &str, &str)] = &[
     ("dispatch", "tests/m02_pr07_dispatch.rs", "dispatch_confirmed_separates_protocol_readbacks_feedback"),
     ("expiry-release", "tests/m02_pr08_expiry_release.rs", "active_expiry_refuses_new_set_allows_cancel_or_null"),
     ("publication", "tests/m02_pr09_publication.rs", "barrier_races_ordered_preview_admission_journal_send_publication"),
-    ("recovery", "tests/m02_pr11_recovery.rs", "forced_exit_after_commit_is_unknown_persists_for_reconcile"),
+    ("recovery", "tests/m02_pr11_recovery.rs", "lost_response_after_commit_is_unknown_persists_for_reconcile"),
     ("custody", "tests/m02_pr12_custody.rs", "expired_contractor_transfer_narrow_new_admission"),
     ("mandatory-reserve-a06", "tests/runtime_cases/cases.rs", "a06_optional_saturation_preserves_mandatory_reservations"),
     ("mandatory-reserve-b07", "tests/bacnet_cases/lifecycle.rs", "b07_shared_saturation_preserves_mandatory_slots"),

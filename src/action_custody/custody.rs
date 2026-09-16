@@ -374,3 +374,73 @@ pub fn require_peer_accepted_before_journal_via_custody(
     )
     .map_err(CustodyError::from)
 }
+
+/// Joined admission through the owned Slice C path (seal verified + guarded
+/// Journal batch). Thin delegation to `crate::action_joined`; raw
+/// `Journal::prepare`/`admit` bypass the seal/activation/wall barriers.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_joined_via_custody(
+    journal: &mut Journal,
+    operation: OperationId,
+    scope: TrustedScope,
+    ceiling: u8,
+    role: crate::access::RoleKind,
+    actor: &str,
+    preview: &Preview,
+    expected_generation: u32,
+) -> Result<Admitted> {
+    crate::action_joined::admit_joined(
+        journal, operation, scope, ceiling, role, actor, preview, expected_generation,
+    )
+}
+
+/// Joined SET authorization through the owned path (activation + holds +
+/// revocation + wall + dispatch, fresh post-admission reads). Thin
+/// delegation to `crate::action_joined`.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_joined_setpoint_via_custody(
+    journal: &Journal,
+    store: &AcceptanceStore,
+    admitted: &Admitted,
+    preview: &Preview,
+    current: &Current,
+    route: &FrozenRoute,
+    cancel: &DispatchCancel,
+    deadline: Instant,
+    expiry: &ExpiryState,
+    freshness: Freshness,
+    holds: &ScopeHolds,
+    exclusion: Option<&OldWriterExclusion>,
+    is_revoked: bool,
+    impact: &ImpactGate,
+) -> Result<FrozenWrite> {
+    crate::action_joined::authorize_joined_setpoint(
+        journal, store, admitted, preview, current, route, cancel, deadline, expiry,
+        freshness, holds, exclusion, is_revoked, impact,
+    )
+}
+
+/// Joined NULL-release authorization through the owned path (constrained
+/// cleanup stays exempt from wall expiry). Thin delegation to joined.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_joined_release_via_custody(
+    journal: &Journal,
+    store: &AcceptanceStore,
+    admitted: &Admitted,
+    preview: &Preview,
+    current: &Current,
+    route: &FrozenRoute,
+    cancel: &DispatchCancel,
+    deadline: Instant,
+    expiry: &ExpiryState,
+    freshness: Freshness,
+    holds: &ScopeHolds,
+    exclusion: Option<&OldWriterExclusion>,
+    is_revoked: bool,
+    impact: &ImpactGate,
+) -> Result<FrozenWrite> {
+    crate::action_joined::authorize_joined_release(
+        journal, store, admitted, preview, current, route, cancel, deadline, expiry,
+        freshness, holds, exclusion, is_revoked, impact,
+    )
+}

@@ -127,6 +127,33 @@ pub fn require_peer_accepted_before_journal_via_publication(
         .map_err(PublicationError::from)
 }
 
+/// Joined SET authorization through the owned Slice C path. Thin delegation
+/// to `crate::action_joined` (seal + activation + holds + wall + dispatch);
+/// raw dispatch preparation bypasses those barriers. Returns the joined
+/// (custody) error so machine codes stay preserved without collapsing.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_joined_setpoint_via_publication(
+    journal: &crate::action_journal::Journal,
+    store: &crate::accept::AcceptanceStore,
+    admitted: &Admitted,
+    preview: &Preview,
+    current: &Current,
+    route: &FrozenRoute,
+    cancel: &DispatchCancel,
+    deadline: Instant,
+    expiry: &ExpiryState,
+    freshness: Freshness,
+    holds: &crate::action_custody::ScopeHolds,
+    exclusion: Option<&OldWriterExclusion>,
+    is_revoked: bool,
+    impact: &ImpactGate,
+) -> std::result::Result<FrozenWrite, crate::action_custody::CustodyError> {
+    crate::action_joined::authorize_joined_setpoint(
+        journal, store, admitted, preview, current, route, cancel, deadline, expiry,
+        freshness, holds, exclusion, is_revoked, impact,
+    )
+}
+
 /// Require the admitted revisions to match the currently ACTIVE publication
 /// before a new handoff. Reads the durable active pointer PLUS the current
 /// accepted event and its staged configuration (long reads, no transaction)

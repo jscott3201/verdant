@@ -251,10 +251,15 @@ pub fn decide_set_allowed(expiry: &ExpiryState, freshness: Freshness) -> Result<
     }
 }
 
-/// Authorize one frozen SET handoff after the expiry/freshness gate, then
-/// delegate to the existing dispatch preparation (actor/ceiling/policy/
-/// binding/generation/value/deadline plus cooperative cancellation). No new
-/// SET is authorized after expiry or under indeterminate time.
+/// Authorize one frozen SET handoff after the durable deadline wall plus the
+/// expiry/freshness gate, then delegate to the existing dispatch preparation
+/// (actor/ceiling/policy/binding/generation/value/deadline plus cooperative
+/// cancellation). The durable `created_secs` is re-read from the admitted row
+/// (survives reopen without old objects); `now` is the real wall clock.
+/// Wall-expired maps to `expiry-expired`, rollback/cross-boot wall maps to
+/// `expiry-indeterminate`; a delayed queue plus a fresh `Instant` cannot
+/// renew this wall. No new SET is authorized after expiry or under
+/// indeterminate time.
 pub fn authorize_set(
     admitted: &Admitted,
     preview: &Preview,
@@ -265,9 +270,51 @@ pub fn authorize_set(
     expiry: &ExpiryState,
     freshness: Freshness,
 ) -> Result<FrozenWrite> {
-    decide_set_allowed(expiry, freshness)?;
+    let now_secs = wall_now_secs()?;
+    authorize_set_with_wall(
+        admitted, preview, current, route, cancel, deadline, expiry, freshness, now_secs,
+    )
+}
+
+/// Authorize one frozen SET against an explicit wall `now_secs` (live path
+/// with caller-supplied now for deterministic tests; product callers pass
+/// the real wall via [`authorize_set`]). Consults the durable
+/// `created_secs` re-read from `admitted` plus `now_secs` via
+/// [`decide_set_with_wall_anchor`] before any dispatch preparation.
+/// Wall-expired refuses `expiry-expired` with zero sends; rollback refuses
+/// `expiry-indeterminate` while admitted NULL stays exempt (see release).
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_set_with_wall(
+    admitted: &Admitted,
+    preview: &Preview,
+    current: &Current,
+    route: &FrozenRoute,
+    cancel: &DispatchCancel,
+    deadline: Instant,
+    expiry: &ExpiryState,
+    freshness: Freshness,
+    now_secs: i64,
+) -> Result<FrozenWrite> {
+    decide_set_with_wall_anchor(
+        expiry,
+        freshness,
+        admitted.created_secs(),
+        now_secs,
+        admitted.deadline_secs(),
+    )?;
     crate::action_dispatch::prepare_setpoint(admitted, preview, current, route, cancel, deadline)
         .map_err(ExpiryError::from)
+}
+
+/// Real wall-clock seconds for the live authorize path (no test clock).
+/// A clock before the epoch refuses as indeterminate, never a renewed window.
+fn wall_now_secs() -> Result<i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ExpiryError::Indeterminate { reason: "wall-rollback" })?;
+    i64::try_from(now.as_secs()).map_err(|_| ExpiryError::Indeterminate {
+        reason: "wall-rollback",
+    })
 }
 
 /// Authorize an explicit cancel of an unattempted generation. Exact

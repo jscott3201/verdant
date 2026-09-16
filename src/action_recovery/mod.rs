@@ -94,8 +94,9 @@ pub use decisions::{
     PeerAcceptance,
 };
 pub use reconcile::{
-    authorize_cancel_via_expiry, authorize_release_via_expiry, authorize_set_via_expiry,
-    is_same_record, peer_acceptance, prepare_release_via_dispatch, prepare_setpoint_via_dispatch,
+    authorize_cancel_via_expiry, authorize_joined_setpoint_via_recovery,
+    authorize_release_via_expiry, authorize_set_via_expiry, is_same_record, peer_acceptance,
+    prepare_release_via_dispatch, prepare_setpoint_via_dispatch,
     recheck_after_handoff_via_dispatch, reconcile_journal, reconcile_pending_release,
     reconcile_store_operation, reconcile_store_ticket, require_peer_accepted_before_journal,
     require_qualified_recovery, require_reconciled_peer_and_transport, require_same_observation,

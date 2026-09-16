@@ -106,10 +106,10 @@ pub mod publication;
 pub use policy::{assess_impact, assess_target_impact, ImpactGate, OldWriterExclusion};
 #[allow(unused_imports)]
 pub use publication::{
-    authorize_release_via_publication, authorize_setpoint_via_publication,
-    recheck_after_handoff_via_publication, require_activation_current_for_handoff,
-    require_aliases_unique, require_peer_accepted_before_journal_via_publication,
-    verify_handoff_via_publication,
+    authorize_joined_setpoint_via_publication, authorize_release_via_publication,
+    authorize_setpoint_via_publication, recheck_after_handoff_via_publication,
+    require_activation_current_for_handoff, require_aliases_unique,
+    require_peer_accepted_before_journal_via_publication, verify_handoff_via_publication,
 };
 
 /// Publication decision-table wire-format tag (policy refusal only; no wire).
