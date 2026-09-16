@@ -40,6 +40,8 @@ mod action_recovery;
 mod action_publication;
 #[path = "../src/action_custody/mod.rs"]
 mod action_custody;
+#[path = "../src/action_joined.rs"]
+mod action_joined;
 
 use access::RoleKind;
 use action_custody::ScopeHolds;

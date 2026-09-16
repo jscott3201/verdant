@@ -26,9 +26,9 @@
 -- {:.4} text), explicit action kind ('set' vs 'release'), authorized release
 -- admission flag plus release target/obligation reference. The {:.4} payload
 -- text stays presentation-only; handoffs compare wire_bits/kind/target, not
--- rounded text. Slice B (deferred): full lifecycle progression, owned 6/hour
--- accounting, durable custody predecessor link, bounded authorized
--- outstanding -- see explicit TODOs in action_journal/identity.rs.
+-- rounded text. Slice B delivered: lifecycle in action_journal/lifecycle.rs
+-- (0006), owned 6/hour in action_journal/rate.rs, custody predecessor link in
+-- admission_body_v2 -- see action_journal/identity.rs header.
 ALTER TABLE action_journal ADD COLUMN wire_bits INTEGER CHECK (wire_bits IS NULL OR (wire_bits >= 0 AND wire_bits <= 4294967295));
 ALTER TABLE action_journal ADD COLUMN action_kind TEXT CHECK (action_kind IS NULL OR action_kind IN ('set', 'release'));
 ALTER TABLE action_journal ADD COLUMN release_admitted INTEGER CHECK (release_admitted IS NULL OR release_admitted IN (0, 1));

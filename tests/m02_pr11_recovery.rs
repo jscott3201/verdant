@@ -32,6 +32,12 @@ mod action_dispatch;
 mod action_expiry;
 #[path = "../src/action_recovery/mod.rs"]
 mod action_recovery;
+#[path = "../src/action_publication/mod.rs"]
+mod action_publication;
+#[path = "../src/action_custody/mod.rs"]
+mod action_custody;
+#[path = "../src/action_joined.rs"]
+mod action_joined;
 
 use access::RoleKind;
 use action_dispatch::{Current, DispatchCancel, DispatchError, FrozenRoute, ProtocolResult};
@@ -136,8 +142,11 @@ fn forced_exit_before_commit_is_rollback_nothing_admitted() {
     assert_eq!(retry.payload(), "verdant-preview-v1|scope-a|ahu-1|7|1|p8|av2:pv85|degC|22.0000|priority-8-masks-9-16-masked-by-1-7|900s|5s|r0|age60|unavailable-feedback|null-relinquish");
 }
 
+/// Honesty: no child process is involved here; `LostResponse` fault injection
+/// models a lost storage response after commit (UNKNOWN until reconcile).
+/// True post-handoff child-process interruption is Slice D (Sec 7), not here.
 #[test]
-fn forced_exit_after_commit_is_unknown_persists_for_reconcile() {
+fn lost_response_after_commit_is_unknown_persists_for_reconcile() {
     use storage::sqlite::faults::{inject, Fault};
     let scratch = Scratch::new();
     let preview = preview_at(22.0);

@@ -17,8 +17,11 @@
 //! - Client stop/join evidence (`starts/stops/eofs`) stays separate from
 //!   cancellation ack or equipment release.
 //!
-//! TODO(SliceB-deferred): durable attempt progression, bounded outstanding,
-//! custody link; this module stays harness-only, no durable state.
+//! Slice B delivered elsewhere (durable lifecycle in
+//! `action_journal/lifecycle.rs`, bounded outstanding via
+//! `Journal::outstanding_page`, custody link in `admission_body_v2`); this
+//! module stays harness-only, no durable state. Slice C owns the
+//! seal/joined/wall join; see `crate::action_joined`.
 
 #[cfg(test)]
 use super::{DispatchError, ProtocolResult};

@@ -56,6 +56,9 @@ mod action_publication;
 // M02-PR12 maintenance, offboarding and current custody (harness-only; no CLI change here).
 #[allow(dead_code)]
 mod action_custody;
+// M02 Slice C joined seal/admission/dispatch/wall path (harness-only; no CLI change here).
+#[allow(dead_code)]
+mod action_joined;
 // M02-PR10 frozen action/capability manifest for UI + later MCP readers
 // (read-only data; harness-only; no CLI change here).
 #[allow(dead_code)]

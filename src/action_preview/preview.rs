@@ -15,6 +15,8 @@ use crate::domain::values::Unit;
 use crate::observation::normalize::{Refusal, Suitability};
 use crate::observation::time::{ClockReading, Freshness, FreshnessPolicy, TimeEvidence};
 use crate::runtime::bacnet::APDU_RETRIES;
+use crate::semantics::materialize::Plan;
+use crate::semantics::matrix::Report;
 use crate::semantics::sealed_profile::{self, Profile};
 use crate::{accept::AcceptedRevision, access::RoleKind};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -275,11 +277,28 @@ impl Timing {
 
 /// S03-ordered seal evidence: custody, then decode, then reconstruct.
 /// `ledger_status` alone never yields availability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Two paths share the ordered flags:
+/// - marker path (`check_custody`/`decode`/`reconstruct` with no args) sets
+///   the ordered Booleans only. It satisfies [`Self::availability`] for
+///   historical preview construction, but carries no verified proof and
+///   MUST refuse at the joined handoff (see [`Self::is_verified`]).
+/// - real-owner join (`check_custody_with`/`decode_with`/`reconstruct_with`)
+///   calls the S03 owners (custody/root-membership via
+///   `Profile::ledger_status`, decode via `Profile::from_payloads`,
+///   reconstruct via `Profile::verify_report`) and threads the source
+///   ledger bytes through the seal into [`Preview::preview`]. Only this
+///   path yields [`Self::is_verified`] and may pass the joined handoff.
+///   Real `s03-*` codes surface via `From<sealed_profile::Error>`, never
+///   collapsed into `preview-seal-order`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealOrder {
     custody: bool,
     decoded: bool,
     reconstructed: bool,
+    profile: Option<Profile>,
+    ledger: Option<Vec<u8>>,
+    verified: bool,
 }
 
 impl SealOrder {
@@ -288,16 +307,19 @@ impl SealOrder {
             custody: false,
             decoded: false,
             reconstructed: false,
+            profile: None,
+            ledger: None,
+            verified: false,
         }
     }
 
-    /// Seal custody/root membership verified first.
+    /// Marker custody (no proof). Ordered only; not verified for handoff.
     pub fn check_custody(&mut self) -> Result<()> {
         self.custody = true;
         Ok(())
     }
 
-    /// Decode only after custody.
+    /// Marker decode only after custody. Ordered only; not verified.
     pub fn decode(&mut self) -> Result<()> {
         if !self.custody {
             return Err(PreviewError::SealOrder {
@@ -308,7 +330,7 @@ impl SealOrder {
         Ok(())
     }
 
-    /// Reconstruct only after decode.
+    /// Marker reconstruct only after decode. Ordered only; not verified.
     pub fn reconstruct(&mut self) -> Result<()> {
         if !self.custody || !self.decoded {
             return Err(PreviewError::SealOrder {
@@ -319,13 +341,96 @@ impl SealOrder {
         Ok(())
     }
 
-    /// Available only after the full ordered chain.
+    /// Real-owner custody/root membership: the supplied ledger bytes must be
+    /// the profile's ledger roots (`Profile::ledger_status` Available).
+    /// Stores the profile plus source bytes for the decode join.
+    pub fn check_custody_with(&mut self, profile: &Profile, ledger_bytes: &[u8]) -> Result<()> {
+        profile.ledger_status(ledger_bytes).require()?;
+        self.custody = true;
+        self.profile = Some(profile.clone());
+        self.ledger = Some(ledger_bytes.to_vec());
+        Ok(())
+    }
+
+    /// Real-owner decode only after real custody: `Profile::from_payloads`
+    /// must succeed and identify the custody profile (digest match).
+    pub fn decode_with(&mut self, payloads: &[&str]) -> Result<()> {
+        if !self.custody || self.profile.is_none() {
+            return Err(PreviewError::SealOrder {
+                detail: "decode requires real custody",
+            });
+        }
+        let decoded = Profile::from_payloads(payloads)?;
+        match &self.profile {
+            Some(held) if held == &decoded => {}
+            Some(_) => {
+                return Err(PreviewError::from(
+                    sealed_profile::Error::LedgerDigestMismatch,
+                ));
+            }
+            None => {
+                return Err(PreviewError::SealOrder {
+                    detail: "decode requires real custody",
+                });
+            }
+        }
+        self.decoded = true;
+        Ok(())
+    }
+
+    /// Real-owner reconstruct only after real decode: the stored profile
+    /// must verify against the supplied report/plan
+    /// (`Profile::verify_report`: digest then meaning). Marks verified.
+    pub fn reconstruct_with(&mut self, report: &Report, plan: &Plan) -> Result<()> {
+        if !self.custody || !self.decoded {
+            return Err(PreviewError::SealOrder {
+                detail: "reconstruct before decode",
+            });
+        }
+        let profile = self.profile.as_ref().ok_or(PreviewError::SealOrder {
+            detail: "reconstruct requires decoded profile",
+        })?;
+        profile.verify_report(report, plan)?;
+        self.reconstructed = true;
+        self.verified = true;
+        Ok(())
+    }
+
+    /// Whether the full real-owner chain verified (custody + decode +
+    /// reconstruct through the S03 owners with ledger bytes held). Only
+    /// verified seals may pass the joined handoff; marker-only seals refuse there.
+    pub fn is_verified(&self) -> bool {
+        self.verified && self.custody && self.decoded && self.reconstructed && self.ledger.is_some()
+    }
+
+    /// Verified ledger digest for evidence (None for marker seals).
+    pub fn ledger_digest(&self) -> Option<&str> {
+        self.profile.as_ref().map(|p| p.ledger_digest())
+    }
+
+    /// Available only after the full ordered chain (marker or verified).
+    /// Preview construction accepts either; the joined handoff additionally
+    /// requires [`Self::is_verified`].
     pub fn availability(&self) -> Result<()> {
         if self.custody && self.decoded && self.reconstructed {
             Ok(())
         } else {
             Err(PreviewError::SealOrder {
                 detail: "seal-custody/decode/reconstruct order required",
+            })
+        }
+    }
+
+    /// Verified availability for the joined handoff: ordered chain PLUS
+    /// real-owner verification. Marker-only Booleans refuse here with
+    /// `preview-seal-order` (or the preserved `s03-*` from the join).
+    pub fn verified_availability(&self) -> Result<()> {
+        self.availability()?;
+        if self.is_verified() {
+            Ok(())
+        } else {
+            Err(PreviewError::SealOrder {
+                detail: "marker seal without real S03 custody/decode/reconstruct proof; joined handoff refused",
             })
         }
     }
@@ -362,6 +467,17 @@ pub struct Preview {
     feedback: FeedbackPlan,
     array: PriorityArrayView,
     release: ReleasePlan,
+    /// Whether the authoring seal carried the real S03 verified join
+    /// (custody + decode + reconstruct through the S03 owners). Threaded
+    /// from `SealOrder::is_verified` at preview time; frozen
+    /// `canonical_bytes`/`identity_bytes` are unchanged (seal proof gates
+    /// the joined handoff, never the payload text). Marker previews stay
+    /// constructible but refuse at the joined handoff.
+    seal_verified: bool,
+    /// Verified S03 ledger digest when sealed-verified, else None.
+    /// Source bytes (ledger) are threaded via the seal into preview;
+    /// the digest is evidence only, never payload identity.
+    seal_ledger_digest: Option<String>,
 }
 
 impl Preview {
@@ -412,6 +528,11 @@ impl Preview {
         let _aliases = AliasSet::new(aliases)?;
         precondition.check_fresh()?;
         seal.availability()?;
+        // Source bytes are threaded via the seal: a verified seal carries
+        // the S03 ledger digest into the preview for the joined handoff.
+        // Marker seals thread nothing (None) and refuse there.
+        let seal_verified = seal.is_verified();
+        let seal_ledger_digest = seal.ledger_digest().filter(|_| seal.ledger.is_some()).map(str::to_string);
         let timing = Timing::synthetic();
         let feedback = FeedbackPlan::pv_readback();
         let array = PriorityArrayView::new(priority, Some(encoded.wire_c()), encoded.wire_c());
@@ -427,6 +548,8 @@ impl Preview {
             feedback,
             array,
             release,
+            seal_verified,
+            seal_ledger_digest,
         })
     }
 
@@ -526,13 +649,26 @@ impl Preview {
         self.release.admitted()
     }
 
+    /// Whether the authoring seal carried the real S03 verified join.
+    /// The joined handoff requires true; marker previews refuse there.
+    pub fn seal_verified(&self) -> bool {
+        self.seal_verified
+    }
+
+    /// Verified S03 ledger digest threaded via the seal, if verified.
+    pub fn seal_ledger_digest(&self) -> Option<&str> {
+        self.seal_ledger_digest.as_deref()
+    }
+
     /// Lossless identity for admission/handoff comparison (field order frozen).
     /// Presentation `canonical_bytes` plus exact `wire_bits` (binary32, not
     /// `{:.4}`), explicit kind (`set` vs `release`), release admission flag
     /// and authorized release target. Two previews with equal presentation
     /// but different bits/kind/target have different identity and MUST NOT
     /// reconcile. Identical retries (equal identity) are authorized outcome
-    /// inspection, not a new physical attempt (see Slice B TODO in journal).
+    /// inspection, not a new physical attempt (Slice B delivered: durable
+    /// lifecycle in `action_journal/lifecycle.rs`, owned rate in
+    /// `action_journal/rate.rs`, custody link via `admission_body_v2`).
     pub fn identity_bytes(&self) -> String {
         format!(
             "{}|bits{:08X}|kind:{}|rel:{}:{}|{}",

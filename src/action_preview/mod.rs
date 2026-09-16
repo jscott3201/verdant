@@ -70,6 +70,10 @@ pub enum PreviewError {
     NullNotAdmitted,
     RateExceeded { used: u32, limit: u32 },
     SealOrder { detail: &'static str },
+    /// Real S03 refusal, never collapsed: preserves the exact `s03-*`
+    /// (or delegated `s01-*`/parse/materialize) code from
+    /// [`crate::semantics::sealed_profile::Error::code`].
+    Sealed { code: &'static str, detail: String },
 }
 
 impl PreviewError {
@@ -90,6 +94,7 @@ impl PreviewError {
             Self::NullNotAdmitted => "preview-null-not-admitted",
             Self::RateExceeded { .. } => "preview-rate-exceeded",
             Self::SealOrder { .. } => "preview-seal-order",
+            Self::Sealed { code, .. } => code,
         }
     }
 }
@@ -125,11 +130,22 @@ impl std::fmt::Display for PreviewError {
                 write!(f, "rate exceeded: {used} >= {limit}/hour")
             }
             Self::SealOrder { detail } => write!(f, "seal order refused: {detail}"),
+            Self::Sealed { code, detail } => write!(f, "seal {code}: {detail}"),
         }
     }
 }
 
 impl std::error::Error for PreviewError {}
+
+impl From<crate::semantics::sealed_profile::Error> for PreviewError {
+    /// Preserve the real S03 machine code verbatim, never collapsed into
+    /// `preview-seal-order`. The detail carries the owner debug for evidence.
+    fn from(error: crate::semantics::sealed_profile::Error) -> Self {
+        let code = error.code();
+        let detail = std::format!("{error:?}");
+        Self::Sealed { code, detail }
+    }
+}
 
 pub type Result<T> = std::result::Result<T, PreviewError>;
 

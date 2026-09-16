@@ -286,8 +286,11 @@ impl Journal {
     }
 
     /// Validate preview read-only and stage a ticket; no durable write yet.
+    /// `pub(crate)`: product and gate callers must use the joined path
+    /// (`crate::action_joined::admit_joined`); raw staging bypasses the
+    /// seal/activation/wall barriers. Binary-only, no external consumers.
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare(
+    pub(crate) fn prepare(
         &self,
         operation: OperationId,
         scope: TrustedScope,
@@ -303,8 +306,9 @@ impl Journal {
     /// Validate plus stage with a durable predecessor obligation link in the
     /// same batch (`None` for fresh admissions). Equivalence is checked by
     /// the custody owner before this ticket; the writer only persists the link.
+    /// `pub(crate)`: use the joined path; raw staging bypasses seal/activation/wall.
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare_with_predecessor(
+    pub(crate) fn prepare_with_predecessor(
         &self,
         operation: OperationId,
         scope: TrustedScope,
@@ -402,7 +406,10 @@ impl Journal {
     }
 
     /// Convenience: prepare then submit with the same identities.
-    pub fn admit(
+    /// `pub(crate)`: product and gate callers must use the joined path
+    /// (`crate::action_joined::admit_joined`); raw admission bypasses the
+    /// seal/activation/wall barriers. Binary-only, no external consumers.
+    pub(crate) fn admit(
         &mut self,
         operation: OperationId,
         scope: TrustedScope,
@@ -417,8 +424,9 @@ impl Journal {
     }
 
     /// Convenience with a durable predecessor obligation link in the same batch.
+    /// `pub(crate)`: use the joined path (transfer-narrow owner); raw bypasses barriers.
     #[allow(clippy::too_many_arguments)]
-    pub fn admit_with_predecessor(
+    pub(crate) fn admit_with_predecessor(
         &mut self,
         operation: OperationId,
         scope: TrustedScope,

@@ -83,7 +83,7 @@
 pub mod policy;
 pub mod release;
 
-pub use policy::{assess_cleanup, assess_deadline_wall, assess_expiry, authorize_cancel, authorize_set, decide_set_allowed, decide_set_with_wall_anchor, wall_age_millis};
+pub use policy::{assess_cleanup, assess_deadline_wall, assess_expiry, authorize_cancel, authorize_set, authorize_set_with_wall, decide_set_allowed, decide_set_with_wall_anchor, wall_age_millis};
 pub use policy::{ExpiryHorizon, ExpiryState, deadline_instant, next_generation};
 pub use policy::{require_confirmed, require_same_boot};
 pub use release::{PendingRelease, authorize_release, authorize_release_with_wall};

@@ -141,6 +141,33 @@ pub fn authorize_cancel_via_expiry(expected_generation: u32, current_generation:
         .map_err(RecoveryError::from)
 }
 
+/// Joined SET authorization through the owned Slice C path (seal + activation
+/// + holds + wall + dispatch). Thin delegation to `crate::action_joined`;
+/// raw `prepare_setpoint_via_dispatch` bypasses those barriers. Returns the
+/// joined (custody) error so machine codes stay preserved.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_joined_setpoint_via_recovery(
+    journal: &Journal,
+    store: &crate::accept::AcceptanceStore,
+    admitted: &Admitted,
+    preview: &Preview,
+    current: &Current,
+    route: &FrozenRoute,
+    cancel: &DispatchCancel,
+    deadline: Instant,
+    expiry: &ExpiryState,
+    freshness: Freshness,
+    holds: &crate::action_custody::ScopeHolds,
+    exclusion: Option<&crate::action_publication::OldWriterExclusion>,
+    is_revoked: bool,
+    impact: &crate::action_publication::ImpactGate,
+) -> std::result::Result<FrozenWrite, crate::action_custody::CustodyError> {
+    crate::action_joined::authorize_joined_setpoint(
+        journal, store, admitted, preview, current, route, cancel, deadline, expiry,
+        freshness, holds, exclusion, is_revoked, impact,
+    )
+}
+
 /// Authorize one frozen NULL release via expiry. Expired or indeterminate
 /// time still permits an admitted NULL release; freshness does not gate it.
 pub fn authorize_release_via_expiry(
