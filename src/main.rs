@@ -56,6 +56,10 @@ mod action_publication;
 // M02-PR12 maintenance, offboarding and current custody (harness-only; no CLI change here).
 #[allow(dead_code)]
 mod action_custody;
+// M02-PR10 frozen action/capability manifest for UI + later MCP readers
+// (read-only data; harness-only; no CLI change here).
+#[allow(dead_code)]
+mod action_manifest;
 #[cfg(test)]
 #[path = "../tests/cli_cases/errors.rs"]
 mod cli_setup_errors;
