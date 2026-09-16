@@ -273,3 +273,59 @@ impl Outcome {
         false
     }
 }
+
+/// Read-only identical-retry inspection (Slice F G3): slot/PV readbacks with
+/// fresh response-correlated times, unavailable feedback, and audit.
+///
+/// Provenance separation by construction (not a discriminator flag): this
+/// type carries NO `ProtocolResult` and NO write identity usable for
+/// completion (`operation`/`attempt`/`scope`/`equipment`/`binding_revision`/
+/// `accepted_revision`/`target_generation` are absent). `Outcome::new`
+/// requires an `&Admitted` plus an explicit `ProtocolResult`; an
+/// `Inspection` cannot supply either, so `record_confirmed_terminal`
+/// (which keeps taking `&Outcome`) rejects an inspection at compile time:
+/// `record_confirmed_terminal(&journal, &admitted, &inspection)` fails with
+/// `expected &Outcome, found &Inspection`. Genuine ack plus canceled/failed
+/// reads still builds `Outcome` with `Confirmed` plus per-readback invalid
+/// flags via `execute_setpoint` (Slice A preserved); validity never gates,
+/// only provenance does. `source_time` stays `None`; no qualification minted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inspection {
+    slot: SlotReadback,
+    pv: PvReadback,
+    feedback: Feedback,
+    audit: Audit,
+}
+
+impl Inspection {
+    pub fn new(slot: SlotReadback, pv: PvReadback, feedback: Feedback, audit: Audit) -> Self {
+        Self { slot, pv, feedback, audit }
+    }
+    pub fn slot(&self) -> &SlotReadback {
+        &self.slot
+    }
+    pub fn pv(&self) -> &PvReadback {
+        &self.pv
+    }
+    pub fn feedback(&self) -> &Feedback {
+        &self.feedback
+    }
+    pub fn audit(&self) -> Audit {
+        self.audit
+    }
+    pub fn format(&self) -> &'static str {
+        DISPATCH_FORMAT
+    }
+    pub fn is_inspection(&self) -> bool {
+        true
+    }
+    pub fn is_dispatch(&self) -> bool {
+        false
+    }
+    pub fn source_time(&self) -> Option<SystemTime> {
+        None
+    }
+    pub fn is_qualified(&self) -> bool {
+        false
+    }
+}

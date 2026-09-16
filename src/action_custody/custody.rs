@@ -460,3 +460,50 @@ pub fn authorize_joined_release_via_custody(
         freshness, holds, exclusion, is_revoked, impact,
     )
 }
+
+/// Discover terminal SET cleanup obligations within the 15-min horizon
+/// (live wall). Thin delegation to the Journal owner
+/// (`lifecycle::cleanup_obligations`); adds only the custody visibility
+/// check. Read-only recovery: Terminal history rows stay unchanged and
+/// reconcile-readable; the admitted-NULL successor carries the predecessor
+/// link (written via `Journal::admit_with_predecessor`, never here). Bounded
+/// page via the store horizon, exact scope filter, no send/mark/resend.
+pub fn inspect_cleanup_obligations(
+    journal: &Journal,
+    scope: &TrustedScope,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Admitted>> {
+    let bound = clamp_page_limit(limit, journal.store().bounds().max_replay_rows);
+    let found = crate::action_journal::lifecycle::cleanup_obligations(journal, scope, bound, offset)
+        .map_err(CustodyError::from)?;
+    for admitted in &found {
+        if !inspection_visible(admitted.scope().as_str(), scope.as_str()) {
+            return Err(CustodyError::Invalid("inspection scope leak"));
+        }
+    }
+    Ok(found)
+}
+
+/// Deterministic seam for the same scan against an explicit wall `now_secs`
+/// (no clock read). Thin delegation to
+/// (`lifecycle::cleanup_obligations_with_now`); same read-only, bounded,
+/// scope-filtered terminal-SET-within-horizon contract as above.
+pub fn inspect_cleanup_obligations_with_now(
+    journal: &Journal,
+    scope: &TrustedScope,
+    limit: u32,
+    offset: u32,
+    now_secs: i64,
+) -> Result<Vec<Admitted>> {
+    let bound = clamp_page_limit(limit, journal.store().bounds().max_replay_rows);
+    let found =
+        crate::action_journal::lifecycle::cleanup_obligations_with_now(journal, scope, bound, offset, now_secs)
+            .map_err(CustodyError::from)?;
+    for admitted in &found {
+        if !inspection_visible(admitted.scope().as_str(), scope.as_str()) {
+            return Err(CustodyError::Invalid("inspection scope leak"));
+        }
+    }
+    Ok(found)
+}
