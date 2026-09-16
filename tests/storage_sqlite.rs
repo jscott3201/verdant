@@ -138,7 +138,7 @@ fn migration_reservation_0001_0002_chain_matches_source() {
         }
     }
     numbered.sort();
-    assert_eq!(numbered, vec!["0001_init.sql", "0002_receipts.sql", "0003_observations.sql", "0004_action_journal.sql", "0005_action_identity.sql"]);
+    assert_eq!(numbered, vec!["0001_init.sql", "0002_receipts.sql", "0003_observations.sql", "0004_action_journal.sql", "0005_action_identity.sql", "0006_action_lifecycle.sql"]);
     assert_eq!(storage::MIGRATION_0002.predecessors, &["0001_init"]);
     assert_eq!(storage::MIGRATION_0002.id, "0002_receipts");
     assert_eq!(std::fs::read_to_string(dir.join("0002_receipts.sql")).expect("read 0002"), storage::MIGRATION_0002_SQL);

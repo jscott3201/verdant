@@ -54,6 +54,7 @@
 pub(crate) mod harness;
 #[cfg(test)]
 pub(crate) mod harness_provenance;
+pub mod lifecycle_decision;
 pub mod outcome;
 #[allow(unused_imports)]
 pub use outcome::*;
@@ -579,6 +580,7 @@ pub fn prepare_setpoint(
     cancel: &DispatchCancel,
     deadline: Instant,
 ) -> Result<FrozenWrite> {
+    crate::action_dispatch::lifecycle_decision::check_lifecycle_for_dispatch(admitted)?;
     check_frozen_preview(preview)?;
     verify_content(admitted, preview, current, route)?;
     verify_generation(admitted, current)?;
@@ -625,6 +627,7 @@ pub fn prepare_release(
     cancel: &DispatchCancel,
     deadline: Instant,
 ) -> Result<FrozenWrite> {
+    crate::action_dispatch::lifecycle_decision::check_lifecycle_for_dispatch(admitted)?;
     check_frozen_preview(preview)?;
     verify_content(admitted, preview, current, route)?;
     verify_generation(admitted, current)?;

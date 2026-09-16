@@ -33,12 +33,14 @@ use crate::domain::scope::TrustedScope;
 use crate::storage::sqlite::{MutationOutcome, PreparedMutation, SqliteStore};
 use crate::storage::{
     ConnectionSettings, Handoff, HandoffReceiver, HandoffSender, StorageError, StoreBounds,
-    MIGRATION_0004_SQL,
 };
 use std::path::Path;
 
 pub mod identity;
+pub mod lifecycle;
+pub mod rate;
 pub use identity::{ActionKind, Identity};
+pub use lifecycle::LifecycleState;
 use self::identity::{check_actor, check_ceiling, check_preview, map_submit_error};
 
 /// Journal wire format tag (inert sink; no wire emission in this slice).
@@ -58,6 +60,9 @@ pub enum WriterError {
     StalePayload { detail: String },
     NotFound { operation: String },
     Unknown { operation: OperationId, detail: String },
+    RateExceeded { used: u32, limit: u32 },
+    DeadlineExceeded { elapsed_secs: u64, deadline_secs: u64 },
+    RateIndeterminate { reason: &'static str },
     Storage(StorageError),
 }
 
@@ -72,6 +77,9 @@ impl WriterError {
             Self::StalePayload { .. } => "admission-stale-payload",
             Self::NotFound { .. } => "admission-not-found",
             Self::Unknown { .. } => "admission-unknown",
+            Self::RateExceeded { .. } => "admission-rate-exceeded",
+            Self::DeadlineExceeded { .. } => "admission-deadline-exceeded",
+            Self::RateIndeterminate { .. } => "admission-indeterminate",
             Self::Storage(inner) => inner.code(),
         }
     }
@@ -103,6 +111,9 @@ impl std::fmt::Display for WriterError {
                 "admission outcome UNKNOWN for {}; reconcile this identity: {detail}",
                 operation.as_str()
             ),
+            Self::RateExceeded { used, limit } => write!(f, "admission rate exceeded: {used} >= {limit}/hour per scope-equipment wall-hour"),
+            Self::DeadlineExceeded { elapsed_secs, deadline_secs } => write!(f, "admission deadline exceeded: elapsed {elapsed_secs}s >= deadline {deadline_secs}s; fresh Instant cannot renew durable wall anchor"),
+            Self::RateIndeterminate { reason } => write!(f, "admission time indeterminate ({reason}): refuse new SET, allow only explicit cancel or admitted-NULL release"),
             Self::Storage(inner) => write!(f, "{inner}"),
         }
     }
@@ -124,7 +135,8 @@ pub type Result<T> = std::result::Result<T, WriterError>;
 /// Slice-A lossless identity: exact `wire_bits`, explicit `set`/`release`
 /// kind, release admission plus authorized target. Legacy 0004 rows carry
 /// `None` and refuse for new handoffs as stale-payload (readable via
-/// reconcile, no backfill).
+/// reconcile, no backfill). Slice-B adds the durable lifecycle state,
+/// predecessor obligation link and `created` wall anchor (deadline/rate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admitted {
     row_id: i64,
@@ -145,6 +157,9 @@ pub struct Admitted {
     action_kind: Option<ActionKind>,
     release_admitted: Option<bool>,
     release_target: Option<InstalledId>,
+    lifecycle: LifecycleState,
+    predecessor: Option<OperationId>,
+    created_secs: i64,
 }
 
 impl Admitted {
@@ -166,6 +181,9 @@ impl Admitted {
     pub fn action_kind(&self) -> Option<ActionKind> { self.action_kind }
     pub fn release_admitted(&self) -> Option<bool> { self.release_admitted }
     pub fn release_target(&self) -> Option<&InstalledId> { self.release_target.as_ref() }
+    pub fn lifecycle(&self) -> LifecycleState { self.lifecycle }
+    pub fn predecessor(&self) -> Option<&OperationId> { self.predecessor.as_ref() }
+    pub fn created_secs(&self) -> i64 { self.created_secs }
     /// Legacy 0004 rounded payload (no lossless identity): readable but stale.
     pub fn is_legacy(&self) -> bool { self.wire_bits.is_none() || self.action_kind.is_none() }
     /// Lossless identity string for identical-retry comparison (None if legacy).
@@ -180,7 +198,8 @@ impl Admitted {
 
 /// Prepared admission: validated intent plus a retained storage ticket.
 /// Submit reconciles or commits; cancel drops without a row or handoff.
-/// Carries lossless identity for post-commit conflict comparison.
+/// Carries lossless identity plus the durable predecessor link for
+/// post-commit conflict comparison.
 #[derive(Debug)]
 pub struct PendingAdmission {
     operation: OperationId,
@@ -195,6 +214,7 @@ pub struct PendingAdmission {
     deadline_secs: u64,
     ceiling: u8,
     actor: String,
+    predecessor: Option<OperationId>,
     ticket: PreparedMutation,
 }
 
@@ -203,6 +223,7 @@ impl PendingAdmission {
     pub fn scope(&self) -> &TrustedScope { &self.scope }
     pub fn expected_generation(&self) -> u32 { self.expected_generation }
     pub fn identity(&self) -> &Identity { &self.identity }
+    pub fn predecessor(&self) -> Option<&OperationId> { self.predecessor.as_ref() }
 }
 
 /// Receivers for the two independent bounded queues.
@@ -229,6 +250,7 @@ impl Journal {
         let (store, _) = SqliteStore::open(db_path, settings, bounds.clone())?;
         ensure_0004(&store)?;
         crate::action_journal::identity::ensure_0005(&store)?;
+        crate::action_journal::lifecycle::ensure_0006(&store)?;
         let (essential_tx, essential) = Handoff::new(bounds.max_tasks).split();
         let (history_tx, history) = Handoff::new(HISTORY_CAPACITY).split();
         Ok((
@@ -275,6 +297,24 @@ impl Journal {
         preview: &Preview,
         expected_generation: u32,
     ) -> Result<PendingAdmission> {
+        self.prepare_with_predecessor(operation, scope, ceiling, role, actor, preview, expected_generation, None)
+    }
+
+    /// Validate plus stage with a durable predecessor obligation link in the
+    /// same batch (`None` for fresh admissions). Equivalence is checked by
+    /// the custody owner before this ticket; the writer only persists the link.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_predecessor(
+        &self,
+        operation: OperationId,
+        scope: TrustedScope,
+        ceiling: u8,
+        role: RoleKind,
+        actor: &str,
+        preview: &Preview,
+        expected_generation: u32,
+        predecessor: Option<OperationId>,
+    ) -> Result<PendingAdmission> {
         check_ceiling(ceiling, role)?;
         let actor = check_actor(actor)?;
         check_preview(preview)?;
@@ -296,13 +336,13 @@ impl Journal {
         }
         let identity = Identity::from_preview(preview);
         let body = crate::action_journal::identity::admission_body_v2(
-            &operation, &scope, preview.target().equipment(), preview.target().binding_revision(), preview.target().accepted_revision(), expected_generation, target_generation, &payload, preview.timing().deadline_secs(), ceiling, &actor, &operation, &identity,
+            &operation, &scope, preview.target().equipment(), preview.target().binding_revision(), preview.target().accepted_revision(), expected_generation, target_generation, &payload, preview.timing().deadline_secs(), ceiling, &actor, &operation, &identity, predecessor.as_ref(),
         );
         let ticket = self
             .store
             .prepare_guarded_batch("1", &body, payload.len())?
             .with_operation(operation.clone());
-        Ok(PendingAdmission { operation, scope, equipment: preview.target().equipment().clone(), binding_revision: preview.target().binding_revision(), accepted_revision: preview.target().accepted_revision(), expected_generation, target_generation, payload, identity, deadline_secs: preview.timing().deadline_secs(), ceiling, actor, ticket })
+        Ok(PendingAdmission { operation, scope, equipment: preview.target().equipment().clone(), binding_revision: preview.target().binding_revision(), accepted_revision: preview.target().accepted_revision(), expected_generation, target_generation, payload, identity, deadline_secs: preview.timing().deadline_secs(), ceiling, actor, predecessor, ticket })
     }
 
     /// Commit or reconcile one prepared admission, then announce to the
@@ -329,6 +369,12 @@ impl Journal {
                     expected: pending.expected_generation,
                     current,
                 });
+            }
+            MutationOutcome::NotCommitted { error: StorageError::SqliteFailure { detail }, .. }
+                if crate::action_journal::rate::is_rate_guard_failure(&detail) =>
+            {
+                let used = self.rate_used(&pending.scope, &pending.equipment).unwrap_or(crate::action_journal::rate::OWNED_RATE_MAX_PER_HOUR);
+                return Err(crate::action_journal::rate::rate_exceeded(used));
             }
             MutationOutcome::NotCommitted { error, .. } => return Err(map_submit_error(error)),
             MutationOutcome::Conflict { detail, .. } => {
@@ -370,6 +416,23 @@ impl Journal {
         self.submit(&pending)
     }
 
+    /// Convenience with a durable predecessor obligation link in the same batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_with_predecessor(
+        &mut self,
+        operation: OperationId,
+        scope: TrustedScope,
+        ceiling: u8,
+        role: RoleKind,
+        actor: &str,
+        preview: &Preview,
+        expected_generation: u32,
+        predecessor: OperationId,
+    ) -> Result<Admitted> {
+        let pending = self.prepare_with_predecessor(operation, scope, ceiling, role, actor, preview, expected_generation, Some(predecessor))?;
+        self.submit(&pending)
+    }
+
     /// Drop a prepared intent before submit: no row, no handoff.
     pub fn cancel(pending: PendingAdmission) {
         drop(pending);
@@ -408,57 +471,123 @@ impl Journal {
         operation: &OperationId,
         scope: &TrustedScope,
     ) -> Result<Admitted> {
-        let script = format!(
-            "SELECT operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state, wire_bits, action_kind, release_admitted, release_target FROM action_journal WHERE operation={} AND scope={};",
-            binding::sql_quote(operation.as_str()),
-            binding::sql_quote(scope.as_str()),
-        );
-        // 0004 stores lack the identity columns: fall back to the 13-column
-        // shape so legacy rows stay readable (they refuse later as stale).
+        // Slice-B join first (20 cols with created + lifecycle + predecessor);
+        // fall back through 17/13 shapes so 0004/0005 rows stay readable.
+        let script = crate::action_journal::lifecycle::read_row_sql(operation, scope);
         let rows = match self.store.exec_script(&script) {
             Ok(rows) => rows,
-            Err(StorageError::SqliteFailure { detail }) if detail.contains("no such column") => {
-                let legacy = format!(
-                    "SELECT operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state FROM action_journal WHERE operation={} AND scope={};",
+            Err(StorageError::SqliteFailure { detail }) if detail.contains("no such column") || detail.contains("no such table") => {
+                let legacy17 = format!(
+                    "SELECT operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state, wire_bits, action_kind, release_admitted, release_target FROM action_journal WHERE operation={} AND scope={};",
                     binding::sql_quote(operation.as_str()),
                     binding::sql_quote(scope.as_str()),
                 );
-                self.store.exec_script(&legacy).map_err(WriterError::from)?
+                match self.store.exec_script(&legacy17) {
+                    Ok(rows) => rows,
+                    Err(StorageError::SqliteFailure { detail }) if detail.contains("no such column") => {
+                        let legacy = format!(
+                            "SELECT operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state FROM action_journal WHERE operation={} AND scope={};",
+                            binding::sql_quote(operation.as_str()),
+                            binding::sql_quote(scope.as_str()),
+                        );
+                        self.store.exec_script(&legacy).map_err(WriterError::from)?
+                    }
+                    Err(other) => return Err(WriterError::from(other)),
+                }
             }
             Err(other) => return Err(WriterError::from(other)),
         };
         let row = rows.into_iter().next().ok_or_else(|| WriterError::NotFound {
             operation: operation.as_str().to_string(),
         })?;
-        if row.len() != 13 && row.len() != 17 {
+        if row.len() != 13 && row.len() != 17 && row.len() != 20 {
             return Err(WriterError::Invalid("journal row shape"));
         }
-        decode_row(row, scope)
+        crate::action_journal::lifecycle::decode_row(row, scope)
     }
 
-    /// Lossless identical-retry comparison: payload text plus exact wire_bits,
-    /// kind, release admission and target. Distinct binary32 values sharing
-    /// `{:.4}` text MUST NOT reconcile; swapped kind/target refuses as
-    /// conflict (SET cannot authorize release and vice versa). Identical
-    /// retries are authorized outcome inspection, not a new physical attempt
-    /// (dispatch inspection path, Slice B durable custody deferred).
+    /// Durable lifecycle state for one operation (conservative admitted when
+    /// no lifecycle row exists; never invented dispatched/terminal).
+    pub fn lifecycle_state(&self, operation: &OperationId, scope: &TrustedScope) -> Result<LifecycleState> {
+        Ok(self.read_row(operation, scope)?.lifecycle())
+    }
+
+    /// Durable `created` wall anchor for deadline math across restart.
+    pub fn created_secs(&self, operation: &OperationId, scope: &TrustedScope) -> Result<i64> {
+        Ok(self.read_row(operation, scope)?.created_secs())
+    }
+
+    /// Owned 6/hour durable count for `(scope, equipment)` in the wall-hour.
+    fn rate_used(&self, scope: &TrustedScope, equipment: &InstalledId) -> Result<u32> {
+        let script = format!(
+            "SELECT COUNT(*) FROM action_journal WHERE scope={} AND equipment={} AND created >= CAST(strftime('%s','now') AS INTEGER)-3600 AND (action_kind='set' OR action_kind IS NULL);",
+            binding::sql_quote(scope.as_str()),
+            binding::sql_quote(equipment.as_str()),
+        );
+        let rows = self.store.exec_script(&script)?;
+        match rows.as_slice() {
+            [row] if row.len() == 1 => row[0].parse::<u32>().map_err(|_| WriterError::Invalid("rate count")),
+            _ => Err(WriterError::Invalid("rate count shape")),
+        }
+    }
+
+    /// Atomic lifecycle transition before any external send (single writer).
+    /// Terminal is final: transitions from terminal refuse as conflict (no
+    /// blind resend). Missing lifecycle rows are created conservatively.
+    pub fn transition(&self, operation: &OperationId, scope: &TrustedScope, new_state: LifecycleState) -> Result<Admitted> {
+        let current = self.read_row(operation, scope)?;
+        if current.lifecycle().is_terminal() && new_state != LifecycleState::Terminal {
+            return Err(WriterError::Conflict { detail: "lifecycle terminal is final; reconcile history, do not resend".to_string() });
+        }
+        if current.lifecycle() == new_state {
+            return Ok(current);
+        }
+        let body = crate::action_journal::lifecycle::transition_body(operation, new_state);
+        let ticket = self.store.prepare_guarded_batch("1", &body, body.len())?;
+        match self.store.submit(&ticket) {
+            MutationOutcome::Committed { .. } => self.read_row(operation, scope),
+            MutationOutcome::NotCommitted { error, .. } => Err(crate::action_journal::lifecycle::map_transition_error(error)),
+            MutationOutcome::Conflict { detail, .. } => Err(WriterError::Conflict { detail }),
+            MutationOutcome::Unknown { operation, detail } => Err(WriterError::Unknown { operation, detail }),
+        }
+    }
+
+    /// Mark admitted -> dispatched before the handoff decision leaves the writer.
+    pub fn mark_dispatched(&self, operation: &OperationId, scope: &TrustedScope) -> Result<Admitted> {
+        self.transition(operation, scope, LifecycleState::Dispatched)
+    }
+    /// Mark dispatched/admitted -> terminal on confirmed outcome.
+    pub fn mark_terminal(&self, operation: &OperationId, scope: &TrustedScope) -> Result<Admitted> {
+        self.transition(operation, scope, LifecycleState::Terminal)
+    }
+    /// Mark admitted/dispatched -> unresolved on uncertain outcome (honest, never resend).
+    pub fn mark_unresolved(&self, operation: &OperationId, scope: &TrustedScope) -> Result<Admitted> {
+        self.transition(operation, scope, LifecycleState::Unresolved)
+    }
+
+    /// Bounded outstanding page: state-filtered (terminal excluded), exact
+    /// scope filter, `LIMIT`/`OFFSET`. Cross-scope callers observe nothing.
+    pub fn outstanding_page(&self, scope: &TrustedScope, limit: u32, offset: u32) -> Result<Vec<Admitted>> {
+        let bound = limit.min(self.store.bounds().max_replay_rows).max(1);
+        // Resolve the page via the lifecycle helper SQL, then hydrate each
+        // operation through the scoped join (preserves nondisclosure).
+        let script = crate::action_journal::lifecycle::outstanding_page_sql(scope, bound, offset);
+        let rows = self.store.exec_script(&script)?;
+        let mut out = Vec::new();
+        for row in rows {
+            if row.len() != 7 {
+                return Err(WriterError::Invalid("outstanding row shape"));
+            }
+            let operation = OperationId::parse(&row[0]).map_err(|_| WriterError::Invalid("outstanding operation"))?;
+            out.push(self.read_row(&operation, scope)?);
+        }
+        Ok(out)
+    }
+
+    /// Slice-B extension: payload plus lossless bits/kind/target plus durable
+    /// predecessor link (see `lifecycle::require_identical`).
     fn require_identical(pending: &PendingAdmission, found: &Admitted) -> Result<()> {
-        if found.payload != pending.payload {
-            return Err(WriterError::Conflict { detail: "operation identity reused with different payload".to_string() });
-        }
-        // Legacy stored rows have no identity: any new admission with the same
-        // operation but lossless identity conflicts (rounded text is not proof).
-        let Some(found_bits) = found.wire_bits else {
-            return Err(WriterError::Conflict { detail: "operation identity reused: legacy rounded payload vs lossless identity".to_string() });
-        };
-        if found_bits != pending.identity.wire_bits
-            || found.action_kind != Some(pending.identity.kind)
-            || found.release_admitted != Some(pending.identity.release_admitted)
-            || found.release_target.as_ref() != Some(&pending.identity.release_target)
-        {
-            return Err(WriterError::Conflict { detail: "operation identity reused with different lossless identity (bits/kind/target)".to_string() });
-        }
-        Ok(())
+        crate::action_journal::lifecycle::require_identical(pending, found)
     }
 
     fn current_generation(
@@ -480,134 +609,8 @@ impl Journal {
     }
 }
 
-fn decode_row(mut row: Vec<String>, scope: &TrustedScope) -> Result<Admitted> {
-    // 0004 legacy rows: 13 columns (no identity). 0005 rows: 17 columns with
-    // lossless identity (NULL on legacy upgrades stays legacy). Both remain
-    // readable; legacy refuses for new handoffs as stale-payload downstream.
-    let is_legacy_shape = row.len() == 13;
-    if row.len() != 13 && row.len() != 17 {
-        return Err(WriterError::Invalid("journal row shape"));
-    }
-    let take = |row: &mut Vec<String>| {
-        if row.is_empty() {
-            Err(WriterError::Invalid("journal row shape"))
-        } else {
-            Ok(row.remove(0))
-        }
-    };
-    let operation = OperationId::parse(&take(&mut row)?)
-        .map_err(|_| WriterError::Invalid("journal operation"))?;
-    let scope_text = take(&mut row)?;
-    if scope_text != scope.as_str() {
-        return Err(WriterError::ScopeDenied {
-            expected: scope.as_str().to_string(),
-            presented: scope_text,
-        });
-    }
-    let equipment =
-        InstalledId::parse(&take(&mut row)?).map_err(|_| WriterError::Invalid("journal equipment"))?;
-    let binding_revision = take(&mut row)?
-        .parse::<u32>()
-        .map(BindingRevision::new)
-        .map_err(|_| WriterError::Invalid("journal binding revision"))?;
-    let accepted_revision = AcceptedRevision::new(
-        take(&mut row)?
-            .parse::<u32>()
-            .map_err(|_| WriterError::Invalid("journal accepted revision"))?,
-    )
-    .map_err(|_| WriterError::Invalid("journal accepted revision"))?;
-    let expected_generation = take(&mut row)?
-        .parse::<u32>()
-        .map_err(|_| WriterError::Invalid("journal expected generation"))?;
-    let target_generation = take(&mut row)?
-        .parse::<u32>()
-        .map_err(|_| WriterError::Invalid("journal target generation"))?;
-    if target_generation != expected_generation.checked_add(1).ok_or(WriterError::Invalid("journal generation order"))? {
-        return Err(WriterError::Invalid("journal generation order"));
-    }
-    let payload = take(&mut row)?;
-    if payload.is_empty() {
-        return Err(WriterError::Invalid("journal payload"));
-    }
-    let deadline_secs = take(&mut row)?
-        .parse::<u64>()
-        .map_err(|_| WriterError::Invalid("journal deadline"))?;
-    if deadline_secs != crate::action_preview::DEADLINE_SECS {
-        return Err(WriterError::Invalid("deadline 5s"));
-    }
-    let ceiling = take(&mut row)?
-        .parse::<u8>()
-        .map_err(|_| WriterError::Invalid("journal ceiling"))?;
-    let actor = take(&mut row)?;
-    check_actor(&actor)?;
-    let attempt =
-        OperationId::parse(&take(&mut row)?).map_err(|_| WriterError::Invalid("journal attempt"))?;
-    if take(&mut row)? != "admitted" {
-        return Err(WriterError::Invalid("journal state"));
-    }
-    if is_legacy_shape {
-        return Ok(Admitted { row_id: 0, operation, scope: scope.clone(), equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, reconciled: false, wire_bits: None, action_kind: None, release_admitted: None, release_target: None });
-    }
-    let wire_bits = match crate::action_journal::identity::parse_nullable(&take(&mut row)?) {
-        None => None,
-        Some(raw) => Some(raw.parse::<u32>().map_err(|_| WriterError::Invalid("journal wire_bits"))?),
-    };
-    let action_kind = match crate::action_journal::identity::parse_nullable(&take(&mut row)?) {
-        None => None,
-        Some(raw) => Some(ActionKind::parse(&raw).ok_or(WriterError::Invalid("journal action kind"))?),
-    };
-    let release_admitted = match crate::action_journal::identity::parse_nullable(&take(&mut row)?) {
-        None => None,
-        Some(raw) => Some(match raw.as_str() { "0" => false, "1" => true, _ => return Err(WriterError::Invalid("journal release admission")) }),
-    };
-    let release_target = match crate::action_journal::identity::parse_nullable(&take(&mut row)?) {
-        None => None,
-        Some(raw) => Some(InstalledId::parse(&raw).map_err(|_| WriterError::Invalid("journal release target"))?),
-    };
-    // Partial identity (some NULL, some set) is corrupt, not legacy: refuse.
-    let legacy = wire_bits.is_none() || action_kind.is_none() || release_admitted.is_none() || release_target.is_none();
-    let complete = wire_bits.is_some() && action_kind.is_some() && release_admitted.is_some() && release_target.is_some();
-    if !legacy && !complete {
-        return Err(WriterError::Invalid("journal identity partial"));
-    }
-    Ok(Admitted { row_id: 0, operation, scope: scope.clone(), equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, reconciled: false, wire_bits, action_kind, release_admitted, release_target })
-}
-
 fn ensure_0004(store: &SqliteStore) -> Result<()> {
-    let rows = store.exec_script("SELECT generation FROM schema_migrations ORDER BY generation;")?;
-    let generations: Vec<String> = rows.into_iter().filter_map(|r| r.into_iter().next()).collect();
-    if generations == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string()]
-        || generations == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()] {
-        return Ok(());
-    }
-    if generations != vec!["1".to_string(), "2".to_string(), "3".to_string()] {
-        return Err(WriterError::Invalid("unsupported ledger for 0004 upgrade"));
-    }
-    let ticket = store.prepare_guarded_batch("1", MIGRATION_0004_SQL, MIGRATION_0004_SQL.len())?;
-    match store.submit(&ticket) {
-        MutationOutcome::Committed { .. } => Ok(()),
-        MutationOutcome::NotCommitted { error, .. } => {
-            let again = store.exec_script("SELECT generation FROM schema_migrations ORDER BY generation;")?;
-            let again: Vec<String> = again.into_iter().filter_map(|r| r.into_iter().next()).collect();
-            if again == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string()] {
-                Ok(())
-            } else {
-                Err(map_submit_error(error))
-            }
-        }
-        MutationOutcome::Conflict { detail, .. } => {
-            let again = store.exec_script("SELECT generation FROM schema_migrations ORDER BY generation;")?;
-            let again: Vec<String> = again.into_iter().filter_map(|r| r.into_iter().next()).collect();
-            if again == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string()] {
-                Ok(())
-            } else {
-                Err(WriterError::Conflict { detail })
-            }
-        }
-        MutationOutcome::Unknown { operation, detail } => {
-            Err(WriterError::Unknown { operation, detail })
-        }
-    }
+    crate::action_journal::lifecycle::ensure_0004(store)
 }
 
 #[cfg(test)]

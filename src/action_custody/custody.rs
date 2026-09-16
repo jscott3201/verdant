@@ -11,8 +11,9 @@
 //! SQL guard and NO building-wide lock on a per-target frozen route only.
 
 use super::policy::{
-    authorize_constrained_cleanup as policy_cleanup, check_pre_handoff_not_revoked,
-    check_transfer_narrow, inspection_visible,
+    authorize_constrained_cleanup as policy_cleanup, check_held_for_cleanup,
+    check_pre_handoff_not_revoked, check_transfer_equivalence, check_transfer_narrow,
+    clamp_page_limit, inspection_visible,
 };
 use super::{CustodyError, Result, ScopeHolds};
 use crate::accept::AcceptanceStore;
@@ -114,6 +115,9 @@ pub fn authorize_setpoint_via_custody(
 /// delegate to the existing publication release path. Expired or
 /// indeterminate time still permits an admitted NULL release; freshness
 /// therefore does not gate release. NULL-only admission stays verbatim.
+/// Held scope permits only original-target admitted-null-release; other
+/// cleanup on a held scope returns explicit blocked-cleanup with the
+/// obligation still outstanding (never hidden by a generic held error).
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_release_via_custody(
     admitted: &Admitted,
@@ -129,7 +133,12 @@ pub fn authorize_release_via_custody(
     is_revoked: bool,
     impact: &ImpactGate,
 ) -> Result<FrozenWrite> {
-    holds.check_not_held(admitted.scope().as_str())?;
+    let is_original = admitted.action_kind().map(|k| k.as_str()) == Some("release")
+        && admitted.release_admitted() == Some(true)
+        && preview.release_admitted()
+        && admitted.release_target().map(|t| t.as_str()) == Some(preview.release_target().as_str())
+        && admitted.equipment().as_str() == preview.target().equipment().as_str();
+    check_held_for_cleanup(holds, admitted.scope().as_str(), "admitted-null-release", is_original)?;
     check_pre_handoff_not_revoked(is_revoked, admitted.actor())?;
     crate::action_publication::authorize_release_via_publication(
         admitted, preview, current, route, cancel, deadline, expiry, freshness, exclusion,
@@ -152,49 +161,39 @@ pub fn recheck_after_handoff_via_custody(
     .map_err(CustodyError::from)
 }
 
-/// Inspect outstanding actions within one scope. Long read only (no
-/// transaction); exact scope filter in SQL so cross-scope callers observe
-/// nothing. Pending rows are kept and stay visible; this read never erases.
+/// Inspect outstanding actions within one scope. Bounded page via the Journal
+/// owner: state-filtered (terminal excluded), exact scope filter, `LIMIT`
+/// clamped to the store horizon. Cross-scope callers observe nothing.
+/// Pending rows are kept and stay visible; this read never erases.
 pub fn inspect_outstanding(
     journal: &Journal,
     scope: &TrustedScope,
 ) -> Result<Vec<OutstandingAction>> {
-    let script = format!(
-        "SELECT operation, scope, equipment, target_generation, actor, attempt FROM action_journal WHERE scope={} ORDER BY operation;",
-        crate::binding::sql_quote(scope.as_str()),
-    );
-    let rows = journal.store().exec_script(&script).map_err(|e| {
-        CustodyError::Admission(crate::action_journal::WriterError::Storage(e))
-    })?;
+    inspect_outstanding_bounded(journal, scope, journal.store().bounds().max_replay_rows, 0)
+}
+
+/// Bounded outstanding page consumer (thin delegation to the Journal owner).
+/// `limit` is clamped to the store horizon; `offset` pages through history.
+pub fn inspect_outstanding_bounded(
+    journal: &Journal,
+    scope: &TrustedScope,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<OutstandingAction>> {
+    let bound = clamp_page_limit(limit, journal.store().bounds().max_replay_rows);
+    let page = journal.outstanding_page(scope, bound, offset).map_err(CustodyError::from)?;
     let mut out = Vec::new();
-    for row in rows {
-        if row.len() != 6 {
-            return Err(CustodyError::Invalid("outstanding row shape"));
-        }
-        let operation =
-            OperationId::parse(&row[0]).map_err(|_| CustodyError::Invalid("outstanding operation"))?;
-        let row_scope = row[1].clone();
-        if !inspection_visible(&row_scope, scope.as_str()) {
+    for admitted in page {
+        if !inspection_visible(admitted.scope().as_str(), scope.as_str()) {
             return Err(CustodyError::Invalid("inspection scope leak"));
         }
-        let equipment =
-            InstalledId::parse(&row[2]).map_err(|_| CustodyError::Invalid("outstanding equipment"))?;
-        let target_generation = row[3]
-            .parse::<u32>()
-            .map_err(|_| CustodyError::Invalid("outstanding generation"))?;
-        let actor = row[4].clone();
-        if actor.is_empty() || actor.len() > 128 {
-            return Err(CustodyError::Invalid("outstanding actor"));
-        }
-        let attempt =
-            OperationId::parse(&row[5]).map_err(|_| CustodyError::Invalid("outstanding attempt"))?;
         out.push(OutstandingAction {
-            operation,
+            operation: admitted.operation().clone(),
             scope: scope.clone(),
-            equipment,
-            target_generation,
-            actor,
-            attempt,
+            equipment: admitted.equipment().clone(),
+            target_generation: admitted.target_generation(),
+            actor: admitted.actor().to_string(),
+            attempt: admitted.attempt().clone(),
         });
     }
     Ok(out)
@@ -223,12 +222,16 @@ pub fn reconcile_pending_release_via_custody(
 /// Transfer-narrow via NEW admission (TRANSFER NARROW): move unresolved
 /// responsibility from an expired/offboarded actor to an active permitted
 /// role. Long reads (old reconcile is caller-supplied via `old`) happen
-/// before the ticket; the new ticket carries the exact journal guards; no
-/// network runs under the SQL transaction; announce/recheck after commit is
-/// owned by `Journal::submit`. Old IDs and authorship are preserved (the old
-/// row is never rewritten); the old actor must be excluded; the new actor
-/// must already be permitted (never broadened here); never orphaned without
-/// owner. A held scope blocks the new admission.
+/// before the ticket; the new ticket carries the exact journal guards plus
+/// the durable predecessor obligation link in the same batch; no network runs
+/// under the SQL transaction; announce/recheck after commit is owned by
+/// `Journal::submit`. Old IDs and authorship are preserved (the old row is
+/// never rewritten); the old actor must be excluded (real `AccessGate`
+/// revocation observed by the caller); the new actor must already be
+/// permitted (never broadened here); never orphaned without owner. The
+/// successor must be equivalent on equipment/slot/value/wire_bits/kind/
+/// binding+accepted revisions (any change needs a separate authorized SET;
+/// release cannot migrate hardware). A held scope blocks the new admission.
 #[allow(clippy::too_many_arguments)]
 pub fn transfer_narrow_via_new_admission(
     journal: &mut Journal,
@@ -260,8 +263,10 @@ pub fn transfer_narrow_via_new_admission(
         old_excluded,
         new_is_permitted,
     )?;
+    // Durable equivalence attestation before the ticket (pure, no I/O).
+    check_transfer_equivalence(old, new_preview)?;
     let pending = journal
-        .prepare(
+        .prepare_with_predecessor(
             new_operation,
             new_scope,
             new_ceiling,
@@ -269,6 +274,7 @@ pub fn transfer_narrow_via_new_admission(
             new_actor,
             new_preview,
             new_expected_generation,
+            Some(old.operation().clone()),
         )
         .map_err(CustodyError::from)?;
     journal.submit(&pending).map_err(CustodyError::from)

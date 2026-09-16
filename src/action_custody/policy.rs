@@ -8,6 +8,8 @@
 //! breaks the build, not behavior.
 
 use super::{CustodyError, Result};
+use crate::action_journal::Admitted;
+use crate::action_preview::Preview;
 use std::collections::BTreeMap;
 
 /// Scoped-hold kind. Both variants block only the held scope; neither
@@ -269,4 +271,86 @@ pub fn next_generation(expected: u32) -> Result<u32> {
     expected
         .checked_add(1)
         .ok_or(CustodyError::Invalid("target generation overflow"))
+}
+
+/// Transfer equivalence (pure): the successor preview must match the old
+/// obligation on equipment, value/wire_bits, kind, release admission/target
+/// and binding/accepted revisions. Any change needs a separate authorized
+/// SET; a release can never migrate hardware. All inputs are already-observed.
+pub fn check_transfer_equivalence(old: &Admitted, new_preview: &Preview) -> Result<()> {
+    if old.equipment().as_str() != new_preview.target().equipment().as_str() {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses equipment change; separate authorized SET required".to_string(),
+        });
+    }
+    if old.binding_revision() != new_preview.target().binding_revision() {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses binding-revision change; separate authorized SET required".to_string(),
+        });
+    }
+    if old.accepted_revision() != new_preview.target().accepted_revision() {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses accepted-revision change; separate authorized SET required".to_string(),
+        });
+    }
+    let Some(old_bits) = old.wire_bits() else {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses legacy rounded payload; re-admit with lossless identity".to_string(),
+        });
+    };
+    if old_bits != new_preview.encoded().wire_bits() {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses value/wire_bits change; separate authorized SET required".to_string(),
+        });
+    }
+    if old.action_kind().map(|k| k.as_str()) != Some(new_preview.action_kind()) {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses kind change; SET cannot become release via transfer".to_string(),
+        });
+    }
+    if old.release_admitted() != Some(new_preview.release_admitted()) {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses release-admission change; separate authorized SET required".to_string(),
+        });
+    }
+    if old.release_target().map(|t| t.as_str()) != Some(new_preview.release_target().as_str()) {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses release-target change; release cannot migrate hardware".to_string(),
+        });
+    }
+    // Frozen slot is priority 8; any other priority is a value change.
+    if new_preview.priority().get() != 8 {
+        return Err(CustodyError::Transfer {
+            detail: "transfer equivalence refuses slot change; separate authorized SET required".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Held-vs-cleanup interaction (pure): a held scope blocks new SET, but
+/// permits only original-target `admitted-null-release`/`cancel-unattempted`.
+/// Non-original cleanup on a held scope returns explicit `blocked-cleanup`
+/// (obligation stays outstanding, never hidden by a generic held error).
+pub fn check_held_for_cleanup(
+    holds: &ScopeHolds,
+    scope: &str,
+    cleanup: &str,
+    is_original_target: bool,
+) -> Result<()> {
+    if !holds.is_held(scope) {
+        return Ok(());
+    }
+    match cleanup {
+        "set" => holds.check_not_held(scope),
+        "cancel-unattempted" | "admitted-null-release" if is_original_target => Ok(()),
+        "cancel-unattempted" | "admitted-null-release" => Err(CustodyError::Blocked {
+            detail: format!("blocked-cleanup: held scope '{scope}' permits only original-target {cleanup}; obligation still outstanding"),
+        }),
+        _ => holds.check_not_held(scope),
+    }
+}
+
+/// Clamp a requested outstanding page limit to the store horizon (pure).
+pub fn clamp_page_limit(requested: u32, max: u32) -> u32 {
+    requested.min(max).max(1)
 }

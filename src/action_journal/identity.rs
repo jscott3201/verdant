@@ -170,10 +170,12 @@ pub(crate) fn map_submit_error(error: StorageError) -> WriterError {
 
 /// Additive 0005 ensure: validate 0004 ledger then apply 0005 once. Preserves
 /// `user_version=1`; never rewrites 0004; no backfill (legacy NULLs stay).
+/// Slice-B: a 0006 ledger already contains 0005, so it is accepted as done.
 pub(crate) fn ensure_0005(store: &SqliteStore) -> Result<()> {
     let rows = store.exec_script("SELECT generation FROM schema_migrations ORDER BY generation;")?;
     let generations: Vec<String> = rows.into_iter().filter_map(|r| r.into_iter().next()).collect();
-    if generations == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()] {
+    if generations == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()]
+        || generations == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string(), "6".to_string()] {
         return Ok(());
     }
     if generations != vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string()] {
@@ -185,7 +187,8 @@ pub(crate) fn ensure_0005(store: &SqliteStore) -> Result<()> {
         MutationOutcome::NotCommitted { error, .. } => {
             let again = store.exec_script("SELECT generation FROM schema_migrations ORDER BY generation;")?;
             let again: Vec<String> = again.into_iter().filter_map(|r| r.into_iter().next()).collect();
-            if again == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()] {
+            if again == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()]
+                || again == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string(), "6".to_string()] {
                 Ok(())
             } else {
                 Err(map_submit_error(error))
@@ -194,7 +197,8 @@ pub(crate) fn ensure_0005(store: &SqliteStore) -> Result<()> {
         MutationOutcome::Conflict { detail, .. } => {
             let again = store.exec_script("SELECT generation FROM schema_migrations ORDER BY generation;")?;
             let again: Vec<String> = again.into_iter().filter_map(|r| r.into_iter().next()).collect();
-            if again == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()] {
+            if again == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string()]
+                || again == vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string(), "5".to_string(), "6".to_string()] {
                 Ok(())
             } else {
                 Err(WriterError::Conflict { detail })
@@ -221,6 +225,7 @@ pub(crate) fn admission_body_v2(
     actor: &str,
     attempt: &OperationId,
     identity: &Identity,
+    predecessor: Option<&OperationId>,
 ) -> String {
     let scope_q = binding::sql_quote(scope.as_str());
     let equip_q = binding::sql_quote(equipment.as_str());
@@ -241,12 +246,19 @@ pub(crate) fn admission_body_v2(
     body.push_str(&format!(
         "CREATE TEMP TABLE admission_generation(ok INTEGER NOT NULL CONSTRAINT admission_generation CHECK(ok=1)); INSERT INTO admission_generation VALUES(CASE WHEN ((SELECT COALESCE((SELECT current_generation FROM action_targets WHERE scope={scope_q} AND equipment={equip_q}), 0)) = {expected}) THEN 1 ELSE 0 END);"
     ));
+    // Owned 6/hour SET accounting (Slice B): enforced here under the writer
+    // lock, anchored to durable `created`. Releases skip the guard (exempt).
+    if identity.kind == ActionKind::Set {
+        body.push_str(&super::rate::rate_guard_sql(scope, equipment));
+    }
     body.push_str(&format!(
         "INSERT INTO action_journal(operation, scope, equipment, binding_revision, accepted_revision, expected_generation, target_generation, payload, deadline_secs, ceiling, actor, attempt, state, created, wire_bits, action_kind, release_admitted, release_target) VALUES ({op_q}, {scope_q}, {equip_q}, {binding_rev}, {accepted_rev}, {expected}, {target}, {payload_q}, {deadline}, {ceiling}, {actor_q}, {attempt_q}, 'admitted', CAST(strftime('%s','now') AS INTEGER), {wire_bits}, {kind_q}, {rel_adm}, {release_target_q});"
     ));
     body.push_str(&format!(
         "INSERT INTO action_targets(scope, equipment, current_generation) VALUES ({scope_q}, {equip_q}, {target}) ON CONFLICT(scope, equipment) DO UPDATE SET current_generation=excluded.current_generation;"
     ));
+    // Durable lifecycle row plus predecessor obligation link in the same batch.
+    body.push_str(&super::lifecycle::lifecycle_insert_sql(operation, attempt, predecessor));
     body
 }
 
