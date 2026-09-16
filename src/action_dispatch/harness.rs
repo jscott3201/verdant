@@ -10,7 +10,7 @@
 
 use super::{
     check_frozen_preview, recheck_after_handoff, verify_content, verify_generation, Audit,
-    Current, DispatchCancel, DispatchError, Feedback, FrozenRoute, FrozenWrite, Outcome,
+    Current, DispatchCancel, DispatchError, Feedback, FrozenRoute, FrozenWrite, Outcome, Inspection,
     ProtocolResult, PvReadback, SlotReadback, FROZEN_INSTANCE, FROZEN_PRIORITY, FROZEN_PROPERTY,
     FROZEN_SLOT_PROPERTY,
 };
@@ -680,9 +680,9 @@ pub(crate) async fn execute_release(
         }
     }
 }
-/// Authorized outcome inspection for identical retries: read-only slot+PV (no
+/// Authorized inspection for identical retries: read-only slot+PV (no
 /// WriteProperty), never a new physical attempt. Requires exact lossless identity.
-pub(crate) async fn inspect_identical(admitted: &Admitted, preview: &Preview, current: &Current, route: &FrozenRoute, cancel: &DispatchCancel, deadline: Instant, fixture: &Fixture) -> std::result::Result<Outcome, DispatchError> {
+pub(crate) async fn inspect_identical(admitted: &Admitted, preview: &Preview, current: &Current, route: &FrozenRoute, cancel: &DispatchCancel, deadline: Instant, fixture: &Fixture) -> std::result::Result<Inspection, DispatchError> {
     check_frozen_preview(preview)?;
     verify_content(admitted, preview, current, route)?;
     verify_generation(admitted, current)?;
@@ -696,5 +696,5 @@ pub(crate) async fn inspect_identical(admitted: &Admitted, preview: &Preview, cu
     let (pv_wall, pv_mono) = receipt_now();
     let slot = match slot_res { Ok(b) => SlotReadback::new(b, slot_wall, slot_mono), Err(_) => SlotReadback::invalid(slot_wall, slot_mono) };
     let pv = match pv_res { Ok(b) => PvReadback::new(b, pv_wall, pv_mono), Err(_) => PvReadback::invalid(pv_wall, pv_mono) };
-    Ok(Outcome::new(admitted, ProtocolResult::Confirmed, slot, pv, Feedback::unavailable(), Audit::new(fixture.sent_count())))
+    Ok(Inspection::new(slot, pv, Feedback::unavailable(), Audit::new(fixture.sent_count())))
 }

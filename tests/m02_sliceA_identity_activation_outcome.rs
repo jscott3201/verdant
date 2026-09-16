@@ -200,7 +200,9 @@ async fn identical_retry_is_inspection_not_new_attempt() {
     let route = harness.fixture.route("ahu-1");
     // Inspection: read-only (2 reads, no WriteProperty service 15).
     let inspected = action_dispatch::harness::inspect_identical(&admitted, &preview, &current_gen(0), &route, &DispatchCancel::new(), deadline_5s(), &harness.fixture).await.expect("inspect");
-    assert_eq!(inspected.protocol(), &ProtocolResult::Confirmed);
+    assert!(inspected.is_inspection(), "identical retry yields Inspection, not Confirmed Outcome");
+    assert!(!inspected.is_dispatch());
+    assert!(inspected.source_time().is_none());
     assert!(inspected.slot().is_valid() && inspected.pv().is_valid());
     let requests = harness.fixture.requests();
     assert_eq!(requests.len(), 2, "inspection does 2 reads, no write");

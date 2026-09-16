@@ -354,3 +354,111 @@ pub(crate) fn ensure_0004(store: &SqliteStore) -> Result<()> {
         }
     }
 }
+
+/// Cleanup horizon for terminal SET obligations: 15 minutes (900s), the same
+/// admitted duration (`DURATION_SECS`). A terminal SET within this horizon
+/// still carries its original-target cleanup obligation (relinquish the slot
+/// via an admitted-NULL with a predecessor link); beyond it the obligation is
+/// expired and no longer returned here. No new column/table/migration; this
+/// reads only existing `action_journal` + `action_lifecycle` columns.
+pub const CLEANUP_HORIZON_SECS: u64 = crate::action_preview::DURATION_SECS;
+
+/// Pure horizon predicate for the cleanup scan (deterministic seam, no I/O).
+/// True only when `created <= now < created + horizon` (elapsed `0..horizon`).
+/// Rollback (`now < created`), exact-horizon expiry (`elapsed >= horizon`),
+/// and overflow all report `false` (not due), never an invented obligation.
+pub fn is_cleanup_due(created_secs: i64, now_secs: i64, horizon_secs: u64) -> bool {
+    let horizon = i64::try_from(horizon_secs).unwrap_or(i64::MAX);
+    match now_secs.checked_sub(created_secs) {
+        None => false,
+        Some(delta) if delta < 0 => false,
+        Some(delta) => delta < horizon,
+    }
+}
+
+/// Bounded cleanup-obligation SELECT over existing columns: terminal SET rows
+/// in one scope within the horizon. State-filtered (`terminal` only, history
+/// rows unchanged), kind-filtered (`set` only), scope-filtered (exact),
+/// horizon-filtered (`created <= now` and `created > now - horizon`),
+/// ordered, `LIMIT` plus `OFFSET`. Callers clamp `limit` to the store
+/// horizon; this builder never invents a larger page. No `0007`, no receipt
+/// columns.
+pub(crate) fn cleanup_obligations_sql(
+    scope: &TrustedScope,
+    limit: u32,
+    offset: u32,
+    now_secs: i64,
+    horizon_secs: u64,
+) -> String {
+    let scope_q = binding::sql_quote(scope.as_str());
+    let limit = limit.max(1);
+    let horizon = i64::try_from(horizon_secs).unwrap_or(i64::MAX);
+    let cutoff = now_secs.checked_sub(horizon).unwrap_or(i64::MIN);
+    format!("SELECT j.operation FROM action_journal j JOIN action_lifecycle l ON l.operation=j.operation WHERE j.scope={scope_q} AND l.state='terminal' AND j.action_kind='set' AND j.created <= {now_secs} AND j.created > {cutoff} ORDER BY j.operation LIMIT {limit} OFFSET {offset};")
+}
+
+/// Bounded cleanup-obligation discovery against an explicit wall `now_secs`
+/// (deterministic seam; product callers pass the live wall via
+/// [`cleanup_obligations`]). Read-only: `SELECT` plus scoped `reconcile`
+/// hydration; Terminal history rows are never marked, moved, or deleted.
+/// Scope-filtered (exact equality, cross-scope nondisclosure), `LIMIT`
+/// clamped to the store horizon. Only terminal SET rows within
+/// [`CLEANUP_HORIZON_SECS`] are returned; admitted/dispatched/unresolved,
+/// release kinds, out-of-horizon, and rollback rows are excluded (Rust
+/// re-checks the SQL filters so drift fails closed, never invents).
+pub fn cleanup_obligations_with_now(
+    journal: &super::Journal,
+    scope: &TrustedScope,
+    limit: u32,
+    offset: u32,
+    now_secs: i64,
+) -> Result<Vec<Admitted>> {
+    let bound = limit.min(journal.store().bounds().max_replay_rows).max(1);
+    let horizon = CLEANUP_HORIZON_SECS;
+    let script = cleanup_obligations_sql(scope, bound, offset, now_secs, horizon);
+    let rows = journal.store().exec_script(&script)?;
+    let mut out = Vec::new();
+    for row in rows {
+        if row.len() != 1 {
+            return Err(WriterError::Invalid("cleanup row shape"));
+        }
+        let operation =
+            OperationId::parse(&row[0]).map_err(|_| WriterError::Invalid("cleanup operation"))?;
+        let admitted = journal.reconcile(&operation, scope)?;
+        if admitted.lifecycle() != LifecycleState::Terminal {
+            continue;
+        }
+        if admitted.action_kind() != Some(ActionKind::Set) {
+            continue;
+        }
+        if !is_cleanup_due(admitted.created_secs(), now_secs, horizon) {
+            continue;
+        }
+        if admitted.scope().as_str() != scope.as_str() {
+            return Err(WriterError::ScopeDenied {
+                expected: scope.as_str().to_string(),
+                presented: admitted.scope().as_str().to_string(),
+            });
+        }
+        out.push(admitted);
+    }
+    Ok(out)
+}
+
+/// Bounded cleanup-obligation discovery against the live wall (one live-wall
+/// case; deterministic tests use [`cleanup_obligations_with_now`]). Same
+/// read-only, scope-filtered, LIMIT-clamped terminal-SET-within-horizon scan
+/// as above; a clock before the epoch refuses as invalid, never a renewed
+/// window.
+pub fn cleanup_obligations(
+    journal: &super::Journal,
+    scope: &TrustedScope,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Admitted>> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .map_err(|_| WriterError::Invalid("cleanup wall indeterminate: clock before epoch"))?;
+    cleanup_obligations_with_now(journal, scope, limit, offset, now_secs)
+}
