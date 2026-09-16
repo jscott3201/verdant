@@ -587,6 +587,10 @@ pub(crate) fn prepare_setpoint(
     check_frozen_preview(preview)?;
     verify_content(admitted, preview, current, route)?;
     verify_generation(admitted, current)?;
+    // Authorize→transport anchor: re-verify the durable deadline wall here so
+    // `execute_setpoint` (which funnels through this prepare) refuses an
+    // expired anchor with zero capture even with a fresh Instant/Current.
+    crate::action_dispatch::lifecycle_decision::verify_durable_wall_for_set(admitted)?;
     if admitted.action_kind().map(|k| k.as_str()) != Some("set") {
         return Err(DispatchError::Invalid("SET admission required: release admission cannot authorize SET via swapped preview"));
     }

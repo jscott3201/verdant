@@ -531,6 +531,21 @@ impl Journal {
         Ok(self.read_row(operation, scope)?.created_secs())
     }
 
+    /// Read-only durable currency for handoff (Slice E): the `action_targets`
+    /// `current_generation` for `(scope, equipment)` as last written by the
+    /// admission CAS. The joined authorizers require
+    /// `admitted.target_generation() == durable_current_generation(...)` so a
+    /// superseded admission cannot authorize after a later admission advanced
+    /// the target. Owning-op read only (same open handle, no cross-process
+    /// CAS claim); no transition, no semantics change, no schema change.
+    pub fn durable_current_generation(
+        &self,
+        scope: &TrustedScope,
+        equipment: &InstalledId,
+    ) -> Result<u32> {
+        self.current_generation(scope, equipment)
+    }
+
     /// Owned 6/hour durable count for `(scope, equipment)` in the wall-hour.
     fn rate_used(&self, scope: &TrustedScope, equipment: &InstalledId) -> Result<u32> {
         let script = format!(

@@ -12,6 +12,7 @@
 
 mod preview;
 pub use preview::*;
+pub(crate) mod seal_subject;
 
 use crate::accept::AcceptedRevision;
 use crate::access::{RoleKind, REQUIRED_PUBLISH_CEILING};

@@ -5,8 +5,10 @@
 //! activation is read from the owning [`AcceptanceStore`](crate::accept::AcceptanceStore)
 //! (never `Current` swaps), holds/revocation/exclusion/impact are re-read
 //! after admission but before send, admission runs as a guarded Journal batch,
-//! lifecycle transitions to dispatched before the dispatch decision, and the
-//! durable deadline wall plus expiry/freshness gates the send.
+//! all pure pre-handoff checks (fresh durable re-read plus resend brake,
+//! activation, custody/publication gates, durable currency) run before any
+//! mark with the dispatched transition immediately before the transport
+//! boundary, and the durable deadline wall plus expiry/freshness gates the send.
 //!
 //! Lock discipline (per publication/mod.rs:39-44, custody.rs:7-11,
 //! journal/mod.rs:12-15): long reads (accept history, binding replay, seal
@@ -68,7 +70,7 @@
 use crate::accept::AcceptanceStore;
 use crate::access::RoleKind;
 use crate::action_custody::{CustodyError, ScopeHolds};
-use crate::action_dispatch::{Current, DispatchCancel, FrozenRoute, FrozenWrite, Outcome, ProtocolResult};
+use crate::action_dispatch::{Current, DispatchCancel, DispatchError, FrozenRoute, FrozenWrite, Outcome, ProtocolResult};
 use crate::action_expiry::ExpiryState;
 use crate::action_journal::{Admitted, Journal, LifecycleState};
 use crate::action_preview::{Preview, PreviewError};
@@ -106,10 +108,14 @@ pub fn admit_joined(
 /// Authorize one frozen SET handoff through the joined path. Callers must
 /// supply FRESH reads taken after admission (activation is re-read from the
 /// store inside; `holds`/`is_revoked`/`current`/`impact` must be the current
-/// values, never pre-admission copies): owner reads before ticket (admission
-/// already committed) -> dispatched transition (guarded batch, no network)
-/// -> dispatch decision before send -> authorize with wall (durable
-/// `created` re-read plus real wall now, rollback/cross-boot indeterminate).
+/// values, never pre-admission copies): fresh durable re-read plus resend
+/// brake (a stale `&Admitted` snapshot never decides) -> activation barrier
+/// from the durable store -> pure custody/publication gates (holds,
+/// revocation, exclusion, impact, wall, generation, cancel) on the fresh row
+/// -> durable-currency check (superseded generations refuse) -> dispatched
+/// transition (guarded batch, no network) immediately before returning the
+/// FrozenWrite across the transport boundary. Any refusal above leaves the
+/// row Admitted; only a granted permit marks Dispatched.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_joined_setpoint(
     journal: &Journal,
@@ -128,16 +134,25 @@ pub fn authorize_joined_setpoint(
     impact: &ImpactGate,
 ) -> Result<FrozenWrite> {
     require_seal_verified(preview)?;
-    require_preview_matches_admission(admitted, preview)?;
+    // G1a: fresh durable re-read plus resend brake before any mark. The
+    // caller's `admitted` only keys the read; the durable row decides, so a
+    // sequential double-authorize (already Dispatched) refuses here with zero
+    // new writes. Single-writer discipline: this is the owning-op read on the
+    // same open handle, not a cross-open compare-and-swap.
+    let fresh = journal
+        .reconcile(admitted.operation(), admitted.scope())
+        .map_err(CustodyError::from)?;
+    refuse_resend_without_qualified_recovery(&fresh)?;
+    require_preview_matches_admission(&fresh, preview)?;
     // Owning-op activation barrier (reads the durable store, never Current swaps).
     // Preserve `publication-blocked` verbatim (do not remap to `custody-blocked`
     // via the generic custody `From`; other activation codes already preserve
     // via delegation).
     crate::action_publication::require_activation_current_for_handoff(
         accept_store,
-        admitted.scope(),
-        admitted.binding_revision(),
-        admitted.accepted_revision(),
+        fresh.scope(),
+        fresh.binding_revision(),
+        fresh.accepted_revision(),
     )
     .map_err(|e| match e {
         crate::action_publication::PublicationError::Blocked { detail } => {
@@ -147,14 +162,11 @@ pub fn authorize_joined_setpoint(
         }
         other => CustodyError::from(other),
     })?;
-    // Atomic lifecycle transition before any external send (guarded batch, no network).
-    let dispatched = journal
-        .mark_dispatched(admitted.operation(), admitted.scope())
-        .map_err(CustodyError::from)?;
-    // Custody/publication gates plus wall plus dispatch (no SQL guard, no network yet).
-    // Holds/revocation/exclusion/impact are the fresh post-admission reads.
-    crate::action_custody::authorize_setpoint_via_custody(
-        &dispatched,
+    // All pure pre-handoff gates on the fresh row (custody holds, revocation,
+    // exclusion, impact, wall, generation, cancel): refusals land before any
+    // mark, so the row stays Admitted.
+    let write = crate::action_custody::authorize_setpoint_via_custody(
+        &fresh,
         preview,
         current,
         route,
@@ -166,12 +178,30 @@ pub fn authorize_joined_setpoint(
         exclusion,
         is_revoked,
         impact,
-    )
+    )?;
+    // Durable currency after the gates (preserves their codes): three
+    // generations stay distinct — the pre-admission token
+    // (`expected_generation`, checked against caller `Current` in
+    // `verify_generation`), the post-admission value (`target_generation` =
+    // expected + 1, stored at admit), and the durable current
+    // (`action_targets.current_generation`, advanced by every later
+    // admission). Handoff requires target == durable-current; a superseded
+    // admission refuses here as stale-generation, never ±1-adjusted.
+    require_durable_currency(journal, &fresh)?;
+    // Atomic lifecycle transition only after every pure check passed
+    // (guarded batch, no network), immediately before the transport boundary.
+    journal
+        .mark_dispatched(fresh.operation(), fresh.scope())
+        .map_err(CustodyError::from)?;
+    Ok(write)
 }
 
 /// Authorize one frozen NULL release through the joined path (same barriers;
 /// wall-expired/indeterminate still permits an admitted NULL as constrained
-/// cleanup; held scopes permit only original-target admitted NULL).
+/// cleanup; held scopes permit only original-target admitted NULL). Ordering
+/// mirrors the SET path: fresh re-read plus brake, activation, pure gates,
+/// durable currency, then the dispatched mark immediately before the
+/// transport boundary. Any refusal leaves the row Admitted.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_joined_release(
     journal: &Journal,
@@ -190,12 +220,19 @@ pub fn authorize_joined_release(
     impact: &ImpactGate,
 ) -> Result<FrozenWrite> {
     require_seal_verified(preview)?;
-    require_preview_matches_admission(admitted, preview)?;
+    // G1a: fresh durable re-read plus resend brake before any mark (the
+    // caller's `admitted` only keys the read; same single-writer discipline
+    // as the SET path, not cross-open CAS).
+    let fresh = journal
+        .reconcile(admitted.operation(), admitted.scope())
+        .map_err(CustodyError::from)?;
+    refuse_resend_without_qualified_recovery(&fresh)?;
+    require_preview_matches_admission(&fresh, preview)?;
     crate::action_publication::require_activation_current_for_handoff(
         accept_store,
-        admitted.scope(),
-        admitted.binding_revision(),
-        admitted.accepted_revision(),
+        fresh.scope(),
+        fresh.binding_revision(),
+        fresh.accepted_revision(),
     )
     .map_err(|e| match e {
         crate::action_publication::PublicationError::Blocked { detail } => {
@@ -205,11 +242,9 @@ pub fn authorize_joined_release(
         }
         other => CustodyError::from(other),
     })?;
-    let dispatched = journal
-        .mark_dispatched(admitted.operation(), admitted.scope())
-        .map_err(CustodyError::from)?;
-    crate::action_custody::authorize_release_via_custody(
-        &dispatched,
+    // Pure pre-handoff gates on the fresh row before any mark.
+    let write = crate::action_custody::authorize_release_via_custody(
+        &fresh,
         preview,
         current,
         route,
@@ -221,7 +256,34 @@ pub fn authorize_joined_release(
         exclusion,
         is_revoked,
         impact,
-    )
+    )?;
+    // Durable currency after the gates (same three-generation distinction as
+    // the SET path; preserves gate codes).
+    require_durable_currency(journal, &fresh)?;
+    // Dispatched mark only after every pure check passed, immediately before
+    // the transport boundary.
+    journal
+        .mark_dispatched(fresh.operation(), fresh.scope())
+        .map_err(CustodyError::from)?;
+    Ok(write)
+}
+
+/// Durable-currency gate shared by both authorizers: the admitted
+/// post-admission value (`target_generation`) must still equal the durable
+/// current (`action_targets.current_generation`). A later admission for the
+/// same target advances the durable value, so a superseded op refuses here
+/// as `dispatch-stale-generation` (stale-generation family) with zero sends.
+fn require_durable_currency(journal: &Journal, fresh: &Admitted) -> Result<()> {
+    let durable = journal
+        .durable_current_generation(fresh.scope(), fresh.equipment())
+        .map_err(CustodyError::from)?;
+    if fresh.target_generation() != durable {
+        return Err(CustodyError::Dispatch(DispatchError::StaleGeneration {
+            expected: fresh.target_generation(),
+            current: durable,
+        }));
+    }
+    Ok(())
 }
 
 /// Record a confirmed harness outcome durably as terminal, outside harness.
