@@ -56,6 +56,10 @@ jobs:
       SQLITE_VERSION: '3.53.4'
       SQLITE_URL: https://sqlite.org/2026/sqlite-tools-linux-x64-3530400.zip
       SQLITE_SHA3: 6eeb57e8f2aef7687f9f016a980992cf2799c8c07a87c5e21495530f91915047
+      # Slice E evidence hardening: child-spawn orchestration tests must really
+      # spawn in CI. With VERDANT_REQUIRE_CHILD=1 a spawn failure hard-fails
+      # (no SKIP-and-pass); local default (unset) keeps SKIP-with-reason.
+      VERDANT_REQUIRE_CHILD: '1'
     steps:
       - name: Provision host tools first (setup layer)
         id: tools

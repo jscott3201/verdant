@@ -297,12 +297,19 @@ fn wall_window_passes_rollback_indeterminate_null_exempt() {
     action_joined::admit_joined(&mut j, operation("c-wok-1"), scope_a(), 2, RoleKind::Publisher, "publisher-1/scope-a", &pv, 0).expect("set");
     action_joined::admit_joined(&mut j, operation("c-wnull-1"), scope_a(), 2, RoleKind::Publisher, "publisher-1/scope-a", &rel, 1).expect("null");
     drop(j);
-    shift_created(&scratch, "c-wok-1", -4);
-    shift_created(&scratch, "c-wnull-1", -4);
+    // In-window shift with whole-second margin: `created` truncates to whole
+    // seconds, so -4 risks elapsed 5 (expiry fires before currency); -2 keeps
+    // the wall Active ([2,3]s < 5s deadline) and the supersession refusal loud.
+    shift_created(&scratch, "c-wok-1", -2);
+    shift_created(&scratch, "c-wnull-1", -2);
     let j2 = open_journal(&scratch);
     let adm = j2.reconcile(&operation("c-wok-1"), &scope_a()).expect("rec");
     let route = FrozenRoute::parse("ahu-1", "bacnet-ip://127.0.0.1:20000").expect("route");
-    assert!(action_joined::authorize_joined_setpoint(&j2, &store, &adm, &pv, &cur(binding, rev, 0), &route, &DispatchCancel::new(), dl5(), &ExpiryState::Active, Freshness::Fresh, &ScopeHolds::new(), None, false, &ImpactGate::Preserved).is_ok());
+    // Slice E durable currency: the older SET (target 1) was superseded by the
+    // later release admission (durable current 2), so authorizing it with its
+    // original pre-admission token refuses as stale-generation with zero
+    // sends; the release (target 2 == durable 2) still authorizes below.
+    assert_eq!(action_joined::authorize_joined_setpoint(&j2, &store, &adm, &pv, &cur(binding, rev, 0), &route, &DispatchCancel::new(), dl5(), &ExpiryState::Active, Freshness::Fresh, &ScopeHolds::new(), None, false, &ImpactGate::Preserved).unwrap_err().code(), "dispatch-stale-generation");
     shift_created(&scratch, "c-wok-1", 100);
     shift_created(&scratch, "c-wnull-1", 100);
     let j3 = open_journal(&scratch);

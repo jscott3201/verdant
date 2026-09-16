@@ -346,9 +346,7 @@ impl SealOrder {
     /// Stores the profile plus source bytes for the decode join.
     pub fn check_custody_with(&mut self, profile: &Profile, ledger_bytes: &[u8]) -> Result<()> {
         profile.ledger_status(ledger_bytes).require()?;
-        self.custody = true;
-        self.profile = Some(profile.clone());
-        self.ledger = Some(ledger_bytes.to_vec());
+        super::seal_subject::rebind_custody(&mut self.profile, &mut self.ledger, &mut self.decoded, &mut self.reconstructed, &mut self.verified, &mut self.custody, profile, ledger_bytes);
         Ok(())
     }
 

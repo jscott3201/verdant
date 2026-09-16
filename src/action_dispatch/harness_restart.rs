@@ -91,6 +91,31 @@ pub(crate) fn current_test_exe() -> std::io::Result<PathBuf> {
     std::env::current_exe()
 }
 
+/// Whether a child-spawn failure must hard-fail instead of SKIP-with-reason.
+///
+/// Explicit applicability: this gates ONLY child-spawn orchestration tests
+/// (Slice D `kill_*`/`receipt_*` parents plus future child-spawn proofs).
+/// Local default (unset/anything but `1`) keeps SKIP-with-reason so a host
+/// without process spawn still runs the suite honestly. The CI product job
+/// sets `VERDANT_REQUIRE_CHILD=1`, turning an unavailable/broken spawn into
+/// a hard failure (fail, never a SKIP-and-pass).
+pub(crate) fn child_spawn_mandatory() -> bool {
+    matches!(std::env::var("VERDANT_REQUIRE_CHILD").as_deref(), Ok("1"))
+}
+
+/// Map a child-spawn `Err` to SKIP (local default) or hard failure (CI).
+/// Callers keep their `match` shape: `Ok(child)` proceeds, `Err` skips
+/// locally via the returned `Err`, and the mandatory branch panics with the
+/// explicit reason instead of returning (so CI fails, never passes).
+pub(crate) fn map_spawn_error(test_name: &str, err: std::io::Error) -> std::io::Result<Child> {
+    if child_spawn_mandatory() {
+        panic!(
+            "VERDANT_REQUIRE_CHILD=1: child-spawn failure hard-fails for '{test_name}' (no SKIP-and-pass in CI): {err}"
+        );
+    }
+    Err(err)
+}
+
 /// Spawn one child test as a TRUE separate OS process.
 ///
 /// Runs `current_exe --exact <test_name> --nocapture` plus `extra_args` with
@@ -102,7 +127,21 @@ pub(crate) fn spawn_child_test(
     envs: &[(&str, &str)],
     extra_args: &[&str],
 ) -> std::io::Result<Child> {
-    let exe = current_test_exe()?;
+    match current_test_exe().and_then(|exe| spawn_child_test_with_exe(&exe, test_name, envs, extra_args)) {
+        Ok(child) => Ok(child),
+        Err(err) => map_spawn_error(test_name, err),
+    }
+}
+
+/// Spawn `test_name` from an explicit test-binary path (seam for the
+/// mandatoriness unit proof, which passes a bogus target to observe the
+/// failure branch without breaking real spawn).
+pub(crate) fn spawn_child_test_with_exe(
+    exe: &Path,
+    test_name: &str,
+    envs: &[(&str, &str)],
+    extra_args: &[&str],
+) -> std::io::Result<Child> {
     let mut cmd = Command::new(exe);
     cmd.arg("--exact")
         .arg(test_name)
