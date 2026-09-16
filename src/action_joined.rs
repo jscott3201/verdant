@@ -194,9 +194,9 @@ pub fn authorize_joined_release(
     )
 }
 
-/// Seal gate for the joined path: only the real S03 verified join passes.
-/// Marker-only ordered Booleans refuse as `preview-seal-order` (or the
-/// preserved `s03-*` from the join); `ledger_only` never passes.
+/// Seal gate for the joined path: only the real S03 verified join passes
+/// (verified requires ledger bytes held; digest threads only with ledger).
+/// Marker-only/hybrid seals refuse as `preview-seal-order`; `ledger_only` never passes.
 fn require_seal_verified(preview: &Preview) -> Result<()> {
     if preview.seal_verified() && preview.seal_ledger_digest().is_some() {
         Ok(())

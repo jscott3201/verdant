@@ -355,9 +355,9 @@ impl SealOrder {
     /// Real-owner decode only after real custody: `Profile::from_payloads`
     /// must succeed and identify the custody profile (digest match).
     pub fn decode_with(&mut self, payloads: &[&str]) -> Result<()> {
-        if !self.custody {
+        if !self.custody || self.profile.is_none() {
             return Err(PreviewError::SealOrder {
-                detail: "decode before custody",
+                detail: "decode requires real custody",
             });
         }
         let decoded = Profile::from_payloads(payloads)?;
@@ -369,9 +369,9 @@ impl SealOrder {
                 ));
             }
             None => {
-                // Marker custody carried no profile: adopt the decoded
-                // profile but stay unverified until reconstruct joins it.
-                self.profile = Some(decoded);
+                return Err(PreviewError::SealOrder {
+                    detail: "decode requires real custody",
+                });
             }
         }
         self.decoded = true;
@@ -397,10 +397,10 @@ impl SealOrder {
     }
 
     /// Whether the full real-owner chain verified (custody + decode +
-    /// reconstruct through the S03 owners). Only verified seals may pass
-    /// the joined handoff; marker-only seals refuse there.
+    /// reconstruct through the S03 owners with ledger bytes held). Only
+    /// verified seals may pass the joined handoff; marker-only seals refuse there.
     pub fn is_verified(&self) -> bool {
-        self.verified && self.custody && self.decoded && self.reconstructed
+        self.verified && self.custody && self.decoded && self.reconstructed && self.ledger.is_some()
     }
 
     /// Verified ledger digest for evidence (None for marker seals).
@@ -532,7 +532,7 @@ impl Preview {
         // the S03 ledger digest into the preview for the joined handoff.
         // Marker seals thread nothing (None) and refuse there.
         let seal_verified = seal.is_verified();
-        let seal_ledger_digest = seal.ledger_digest().map(str::to_string);
+        let seal_ledger_digest = seal.ledger_digest().filter(|_| seal.ledger.is_some()).map(str::to_string);
         let timing = Timing::synthetic();
         let feedback = FeedbackPlan::pv_readback();
         let array = PriorityArrayView::new(priority, Some(encoded.wire_c()), encoded.wire_c());

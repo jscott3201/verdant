@@ -360,3 +360,44 @@ fn wall_reopen_repeats_and_seventh_refuses() {
     }
     let _ = OldWriterExclusion::exclude("operator-1/scope-a", "publisher-1/scope-a", "synthetic SliceC manual takeover").expect("excl");
 }
+#[tokio::test(flavor = "current_thread")]
+async fn seal_hybrid_marker_custody_no_adopt_refuses_joined() {
+    use action_dispatch::harness::{Harness, PeerMode, PeerTable};
+    // Hybrid: marker custody + real decode payloads refuses at decode_with (no adopt).
+    let (prof, _ledger, r, p) = s03_all();
+    let pl: Vec<String> = prof.payloads().iter().map(|s| s.to_string()).collect();
+    let refs: Vec<&str> = pl.iter().map(String::as_str).collect();
+    let mut hybrid = SealOrder::new();
+    hybrid.check_custody().expect("marker custody");
+    assert_eq!(hybrid.decode_with(&refs).unwrap_err().code(), "preview-seal-order");
+    // No adopt: no profile/digest, still unverified, reconstruct refuses.
+    assert!(!hybrid.is_verified());
+    assert!(hybrid.ledger_digest().is_none());
+    assert_eq!(hybrid.verified_availability().unwrap_err().code(), "preview-seal-order");
+    assert_eq!(hybrid.reconstruct_with(&r, &p).unwrap_err().code(), "preview-seal-order");
+    // Wrong-ledger custody then decode refuses.
+    let mut bad = SealOrder::new();
+    assert_eq!(bad.check_custody_with(&prof, b"bad").unwrap_err().code(), "s03-ledger-digest-mismatch");
+    assert_eq!(bad.decode_with(&refs).unwrap_err().code(), "preview-seal-order");
+    // End-to-end: complete the hybrid via marker-only so a preview is
+    // constructible, then the joined handoff refuses with zero sends.
+    hybrid.decode().expect("marker decode");
+    hybrid.reconstruct().expect("marker reconstruct");
+    assert!(!hybrid.is_verified());
+    let (_f, store, binding, rev) = active1();
+    let hybrid_pv = Preview::preview(scope_a(), equipment("ahu-1"), binding, rev, BindingStatus::Valid, 2, RoleKind::Publisher, Some(8), 2, 85, None, Unit::parse("degC").expect("u"), 22.0, None, &["ahu-1-sp"], fresh_pre(), &hybrid, equipment("ahu-1"), false).expect("hybrid marker preview");
+    assert!(!hybrid_pv.seal_verified());
+    assert!(hybrid_pv.seal_ledger_digest().is_none());
+    let scratch = Scratch::new();
+    let mut j = open_journal(&scratch);
+    assert_eq!(action_joined::admit_joined(&mut j, operation("c-hyb-1"), scope_a(), 2, RoleKind::Publisher, "publisher-1/scope-a", &hybrid_pv, 0).unwrap_err().code(), "preview-seal-order");
+    // Authorize gate via the live harness path: good admit, hybrid handoff refuses, zero sends.
+    let ok = pv_ok(binding, rev, 22.0, false);
+    let adm = action_joined::admit_joined(&mut j, operation("c-hyb-2"), scope_a(), 2, RoleKind::Publisher, "publisher-1/scope-a", &ok, 0).expect("admit");
+    let harness = Harness::new(PeerTable::default(), PeerMode::Confirm).await;
+    let route = harness.fixture.route("ahu-1");
+    assert_eq!(action_joined::authorize_joined_setpoint(&j, &store, &adm, &hybrid_pv, &cur(binding, rev, 0), &route, &DispatchCancel::new(), dl5(), &ExpiryState::Active, Freshness::Fresh, &ScopeHolds::new(), None, false, &ImpactGate::Preserved).unwrap_err().code(), "preview-seal-order");
+    assert_eq!(harness.fixture.sent_count(), 0);
+    assert!(harness.fixture.requests().is_empty());
+    harness.finish("sliceC-hybrid-refused", &[]).await;
+}
